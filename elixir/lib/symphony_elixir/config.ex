@@ -6,8 +6,36 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Workflow
 
-  @default_prompt_template """
+  @default_linear_prompt_template """
   You are working on a Linear issue.
+
+  Identifier: {{ issue.identifier }}
+  Title: {{ issue.title }}
+
+  Body:
+  {% if issue.description %}
+  {{ issue.description }}
+  {% else %}
+  No description provided.
+  {% endif %}
+  """
+
+  @default_jira_prompt_template """
+  You are working on a Jira issue.
+
+  Identifier: {{ issue.identifier }}
+  Title: {{ issue.title }}
+
+  Body:
+  {% if issue.description %}
+  {{ issue.description }}
+  {% else %}
+  No description provided.
+  {% endif %}
+  """
+
+  @default_prompt_template """
+  You are working on an issue from the configured tracker.
 
   Identifier: {{ issue.identifier }}
   Title: {{ issue.title }}
@@ -76,10 +104,10 @@ defmodule SymphonyElixir.Config do
   def workflow_prompt do
     case Workflow.current() do
       {:ok, %{prompt_template: prompt}} ->
-        if String.trim(prompt) == "", do: @default_prompt_template, else: prompt
+        if String.trim(prompt) == "", do: default_prompt_template(), else: prompt
 
       _ ->
-        @default_prompt_template
+        default_prompt_template()
     end
   end
 
@@ -119,7 +147,7 @@ defmodule SymphonyElixir.Config do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
+      settings.tracker.kind not in ["jira", "linear", "memory"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
@@ -128,8 +156,31 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
+      settings.tracker.kind == "jira" and not is_binary(settings.tracker.base_url) ->
+        {:error, :missing_jira_base_url}
+
+      settings.tracker.kind == "jira" and not is_binary(settings.tracker.api_email) ->
+        {:error, :missing_jira_api_email}
+
+      settings.tracker.kind == "jira" and not is_binary(settings.tracker.api_key) ->
+        {:error, :missing_jira_api_token}
+
+      settings.tracker.kind == "jira" and
+          not is_binary(settings.tracker.project_key) and
+          not is_binary(settings.tracker.jql) ->
+        {:error, :missing_jira_project_key}
+
       true ->
         :ok
+    end
+  end
+
+  defp default_prompt_template do
+    case settings() do
+      {:ok, %{tracker: %{kind: "jira"}}} -> @default_jira_prompt_template
+      {:ok, %{tracker: %{kind: "linear"}}} -> @default_linear_prompt_template
+      {:ok, %{tracker: %{kind: "memory"}}} -> @default_linear_prompt_template
+      _ -> @default_prompt_template
     end
   end
 

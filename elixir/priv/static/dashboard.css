@@ -18,6 +18,26 @@
   --shadow-lg: 0 20px 50px rgba(15, 23, 42, 0.08);
 }
 
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d1117;
+  --page-soft: #11161d;
+  --page-deep: #161c24;
+  --card: rgba(20, 27, 36, 0.92);
+  --card-muted: #19212b;
+  --ink: #edf2f7;
+  --muted: #98a2b3;
+  --line: #243041;
+  --line-strong: #344154;
+  --accent: #2dd4bf;
+  --accent-ink: #052e2b;
+  --accent-soft: rgba(45, 212, 191, 0.16);
+  --danger: #f97066;
+  --danger-soft: rgba(249, 112, 102, 0.14);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.42);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -35,6 +55,12 @@ body {
   color: var(--ink);
   font-family: "Sohne", "SF Pro Text", "Helvetica Neue", "Segoe UI", sans-serif;
   line-height: 1.5;
+}
+
+:root[data-theme="dark"] body {
+  background:
+    radial-gradient(circle at top, rgba(45, 212, 191, 0.16) 0%, rgba(45, 212, 191, 0) 32%),
+    linear-gradient(180deg, var(--page-soft) 0%, var(--page) 26%, #0a0f15 100%);
 }
 
 a {
@@ -109,6 +135,15 @@ button.secondary:hover {
   color: var(--ink);
 }
 
+:root[data-theme="dark"] .subtle-button {
+  background: rgba(20, 27, 36, 0.88);
+  color: var(--muted);
+}
+
+:root[data-theme="dark"] .subtle-button:hover {
+  background: rgba(30, 39, 51, 0.96);
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -133,6 +168,16 @@ pre,
   padding: 2rem 1rem 3.5rem;
 }
 
+.app-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 1rem;
+}
+
+.theme-toggle {
+  min-width: 8.5rem;
+}
+
 .dashboard-shell {
   display: grid;
   gap: 1rem;
@@ -146,6 +191,13 @@ pre,
   border: 1px solid rgba(217, 217, 227, 0.82);
   box-shadow: var(--shadow-sm);
   backdrop-filter: blur(18px);
+}
+
+:root[data-theme="dark"] .hero-card,
+:root[data-theme="dark"] .section-card,
+:root[data-theme="dark"] .metric-card,
+:root[data-theme="dark"] .error-card {
+  border-color: rgba(52, 65, 84, 0.82);
 }
 
 .hero-card {
@@ -225,6 +277,10 @@ pre,
   background: #f5f5f7;
   border-color: var(--line-strong);
   color: var(--muted);
+}
+
+:root[data-theme="dark"] .status-badge-offline {
+  background: rgba(25, 33, 43, 0.9);
 }
 
 [data-phx-main].phx-connected .status-badge-live {
@@ -317,6 +373,11 @@ pre,
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+:root[data-theme="dark"] .code-panel {
+  background: rgba(9, 14, 20, 0.9);
+  border-color: var(--line);
 }
 
 .data-table td {

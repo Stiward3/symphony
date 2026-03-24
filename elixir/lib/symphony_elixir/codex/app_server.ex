@@ -88,6 +88,10 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
+    Logger.info(
+      "Starting Codex turn for #{issue_context(issue)} description_present=#{issue_description_present?(issue)} prompt_chars=#{String.length(prompt)} prompt_preview=#{inspect(prompt_preview(prompt))}"
+    )
+
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
@@ -187,10 +191,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    executable = System.find_executable("bash")
+    {executable, args} = local_codex_shell_command(Config.settings!().codex.command)
 
     if is_nil(executable) do
-      {:error, :bash_not_found}
+      {:error, :shell_not_found}
     else
       port =
         Port.open(
@@ -199,7 +203,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: Enum.map(args, &String.to_charlist/1),
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
@@ -220,6 +224,17 @@ defmodule SymphonyElixir.Codex.AppServer do
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp local_codex_shell_command(command) when is_binary(command) do
+    case :os.type() do
+      {:win32, _} ->
+        {System.find_executable("powershell"),
+         ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]}
+
+      _ ->
+        {System.find_executable("bash"), ["-lc", command]}
+    end
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -333,15 +348,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      nil
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, stream_issue) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, stream_issue)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,7 +366,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          stream_issue
         )
 
       {^port, {:exit_status, status}} ->
@@ -361,13 +378,17 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, stream_issue) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+
+        case stream_issue do
+          nil -> {:ok, :turn_completed}
+          reason -> {:error, reason}
+        end
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -403,7 +424,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          stream_issue
         )
 
       {:ok, payload} ->
@@ -417,7 +439,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, stream_issue)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +456,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, stream_issue)
     end
   end
 
@@ -459,7 +481,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         stream_issue
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -484,7 +507,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, stream_issue)
 
       :approval_required ->
         emit_message(
@@ -517,11 +540,59 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          next_stream_issue = update_stream_issue(stream_issue, method, payload)
+
+          if next_stream_issue != stream_issue do
+            Logger.warning("Codex stream error for #{stream_issue_method(next_stream_issue)}: #{stream_issue_message(next_stream_issue)}")
+          else
+            Logger.debug("Codex notification: #{inspect(method)}")
+          end
+
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, next_stream_issue)
         end
     end
   end
+
+  defp update_stream_issue(current_issue, method, payload) when is_binary(method) and is_map(payload) do
+    case method do
+      "error" -> current_issue || build_stream_issue(method, payload)
+      "codex/event/error" -> current_issue || build_stream_issue(method, payload)
+      "codex/event/stream_error" -> current_issue || build_stream_issue(method, payload)
+      _ -> current_issue
+    end
+  end
+
+  defp update_stream_issue(current_issue, _method, _payload), do: current_issue
+
+  defp build_stream_issue(method, payload) when is_binary(method) and is_map(payload) do
+    {:codex_stream_error, method, extract_stream_issue_message(payload)}
+  end
+
+  defp extract_stream_issue_message(payload) when is_map(payload) do
+    map_path(payload, ["params", "msg", "message"]) ||
+      map_path(payload, ["params", "msg", "text"]) ||
+      map_path(payload, ["params", "error", "message"]) ||
+      map_path(payload, ["params", "message"]) ||
+      inspect(payload)
+  end
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    data
+    |> Map.get(key)
+    |> map_path(rest)
+  end
+
+  defp map_path(data, []) do
+    data
+  end
+
+  defp map_path(_data, _path), do: nil
+
+  defp stream_issue_method({:codex_stream_error, method, _message}), do: method
+  defp stream_issue_method(_reason), do: "unknown"
+
+  defp stream_issue_message({:codex_stream_error, _method, message}) when is_binary(message), do: message
+  defp stream_issue_message(reason), do: inspect(reason)
 
   defp maybe_handle_approval_request(
          port,
@@ -1093,4 +1164,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp needs_input_field?(_payload), do: false
+
+  defp issue_description_present?(%{description: description}) when is_binary(description) do
+    String.trim(description) != ""
+  end
+
+  defp issue_description_present?(_issue), do: false
+
+  defp prompt_preview(prompt) when is_binary(prompt) do
+    prompt
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> String.slice(0, 160)
+  end
+
+  defp prompt_preview(_prompt), do: ""
 end

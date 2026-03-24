@@ -45,6 +45,8 @@ erl_crash.dump
 .credentials
 status.txt
 .codex/original-user-prompt.txt
+debug_*.exs
+symphony-jira-debug*.log
 
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez

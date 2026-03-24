@@ -22,6 +22,28 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert description =~ "Linear"
   end
 
+  test "tool_specs advertises the jira_issue_update contract when jira is configured" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+
+    assert [
+             %{
+               "description" => description,
+               "inputSchema" => %{
+                 "properties" => %{
+                   "comment" => _,
+                   "issueId" => _,
+                   "state" => _
+                 },
+                 "required" => ["issueId"],
+                 "type" => "object"
+               },
+               "name" => "jira_issue_update"
+             }
+           ] = DynamicTool.tool_specs()
+
+    assert description =~ "Jira"
+  end
+
   test "unsupported tools return a failure payload with the supported tool list" do
     response = DynamicTool.execute("not_a_real_tool", %{})
 
@@ -63,6 +85,95 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
     assert Jason.decode!(response["output"]) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
+  end
+
+  test "jira_issue_update can create a comment and transition state" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "jira_issue_update",
+        %{
+          "issueId" => "PRJ-123",
+          "comment" => "Workpad updated",
+          "state" => "Code Review"
+        },
+        tracker_create_comment: fn issue_id, body ->
+          send(test_pid, {:tracker_create_comment, issue_id, body})
+          :ok
+        end,
+        tracker_update_issue_state: fn issue_id, state_name ->
+          send(test_pid, {:tracker_update_issue_state, issue_id, state_name})
+          :ok
+        end
+      )
+
+    assert_received {:tracker_create_comment, "PRJ-123", "Workpad updated"}
+    assert_received {:tracker_update_issue_state, "PRJ-123", "Code Review"}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "commentCreated" => true,
+             "issueId" => "PRJ-123",
+             "stateUpdated" => "Code Review"
+           }
+  end
+
+  test "jira_issue_update validates required action fields" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+
+    missing_action =
+      DynamicTool.execute(
+        "jira_issue_update",
+        %{"issueId" => "PRJ-123"},
+        tracker_create_comment: fn _issue_id, _body -> flunk("comment should not be called") end,
+        tracker_update_issue_state: fn _issue_id, _state -> flunk("state update should not be called") end
+      )
+
+    assert missing_action["success"] == false
+
+    assert Jason.decode!(missing_action["output"]) == %{
+             "error" => %{
+               "message" => "`jira_issue_update` requires at least one of `comment` or `state`."
+             }
+           }
+  end
+
+  test "jira_issue_update reports tracker failures" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+
+    comment_failure =
+      DynamicTool.execute(
+        "jira_issue_update",
+        %{"issueId" => "PRJ-123", "comment" => "hello"},
+        tracker_create_comment: fn _issue_id, _body -> {:error, :forbidden} end
+      )
+
+    assert comment_failure["success"] == false
+
+    assert Jason.decode!(comment_failure["output"]) == %{
+             "error" => %{
+               "message" => "Jira comment creation failed.",
+               "reason" => ":forbidden"
+             }
+           }
+
+    state_failure =
+      DynamicTool.execute(
+        "jira_issue_update",
+        %{"issueId" => "PRJ-123", "state" => "Done"},
+        tracker_update_issue_state: fn _issue_id, _state -> {:error, :state_not_found} end
+      )
+
+    assert state_failure["success"] == false
+
+    assert Jason.decode!(state_failure["output"]) == %{
+             "error" => %{
+               "message" => "Jira state transition failed.",
+               "reason" => ":state_not_found"
+             }
+           }
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do

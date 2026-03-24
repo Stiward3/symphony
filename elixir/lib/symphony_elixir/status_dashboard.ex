@@ -15,7 +15,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-  @running_id_width 8
+  @running_id_width 12
   @running_stage_width 14
   @running_pid_width 8
   @running_age_width 12
@@ -394,12 +394,10 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_project_link_lines do
     project_part =
-      case Config.settings!().tracker.project_slug do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
-
-        _ ->
-          colorize("n/a", @ansi_gray)
+      case tracker_project_reference(Config.settings!().tracker) do
+        {:url, url} -> colorize(url, @ansi_cyan)
+        {:text, text} -> colorize(text, @ansi_cyan)
+        :none -> colorize("n/a", @ansi_gray)
       end
 
     project_line = colorize("│ Project: ", @ansi_bold) <> project_part
@@ -427,7 +425,33 @@ defmodule SymphonyElixir.StatusDashboard do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
 
+  defp tracker_project_reference(%{kind: "linear", project_slug: project_slug})
+       when is_binary(project_slug) and project_slug != "" do
+    {:url, linear_project_url(project_slug)}
+  end
+
+  defp tracker_project_reference(%{kind: "jira", base_url: base_url, project_key: project_key})
+       when is_binary(base_url) and base_url != "" and is_binary(project_key) and project_key != "" do
+    {:url, jira_project_url(base_url, project_key)}
+  end
+
+  defp tracker_project_reference(%{kind: "jira", project_key: project_key})
+       when is_binary(project_key) and project_key != "" do
+    {:text, project_key}
+  end
+
+  defp tracker_project_reference(_tracker), do: :none
+
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+
+  defp jira_project_url(base_url, project_key) do
+    normalized_base_url =
+      base_url
+      |> String.trim_trailing("/")
+      |> String.replace(~r{/rest/api/\d+$}, "")
+
+    normalized_base_url <> "/issues/?jql=" <> URI.encode_www_form("project = \"#{project_key}\"")
+  end
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())

@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls the configured issue tracker for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -21,7 +21,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 5. Keeps Codex working on the issue until the work is done
 
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+skills can make raw Linear GraphQL calls when Linear is the configured tracker.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -83,7 +83,7 @@ Optional flags:
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
-Minimal example:
+Minimal Linear example:
 
 ```md
 ---
@@ -121,6 +121,8 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.stop_issue_state_on_error` optionally moves an issue to a non-active tracker state such as
+  `Blocked` after a real run failure or stall, instead of retrying it automatically.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -128,6 +130,9 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- For Jira, `tracker.api_email` and `tracker.api_key` read from `JIRA_EMAIL` and
+  `JIRA_API_TOKEN` when unset or when values are `$JIRA_EMAIL` and `$JIRA_API_TOKEN`.
+- Jira supports either `tracker.project_key` or a custom `tracker.jql`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -136,6 +141,24 @@ Notes:
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
+workspace:
+  root: $SYMPHONY_WORKSPACE_ROOT
+hooks:
+  after_create: |
+    git clone --depth 1 "$SOURCE_REPO_URL" .
+codex:
+  command: "$CODEX_BIN app-server --model gpt-5.3-codex"
+```
+
+Minimal Jira example:
+
+```yaml
+tracker:
+  kind: jira
+  base_url: https://your-sandbox.atlassian.net
+  api_email: $JIRA_EMAIL
+  api_key: $JIRA_API_TOKEN
+  project_key: ABC
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single Linear issue in its workspace with Codex.
+  Executes a single tracker issue in its workspace with Codex.
   """
 
   require Logger
@@ -107,57 +107,135 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    Process.put(:codex_turn_meaningful_activity, false)
+    on_message = tracking_codex_message_handler(codex_update_recipient, issue)
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    try do
+      with {:ok, turn_session} <-
+             AppServer.run_turn(
+               app_session,
+               prompt,
+               issue,
+               on_message: on_message
+             ) do
+        if Process.get(:codex_turn_meaningful_activity, false) do
+          Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          case continue_with_issue?(issue, issue_state_fetcher) do
+            {:continue, refreshed_issue} when turn_number < max_turns ->
+              Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
+              do_run_codex_turns(
+                app_session,
+                workspace,
+                refreshed_issue,
+                codex_update_recipient,
+                opts,
+                issue_state_fetcher,
+                turn_number + 1,
+                max_turns
+              )
+
+            {:continue, refreshed_issue} ->
+              Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+              :ok
+
+            {:done, _refreshed_issue} ->
+              :ok
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        else
+          Logger.warning(
+            "Codex turn completed without meaningful activity for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
           )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
-
-        {:done, _refreshed_issue} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, reason}
+          {:error, :codex_turn_completed_without_meaningful_activity}
+        end
       end
+    after
+      Process.delete(:codex_turn_meaningful_activity)
+    end
+  end
+
+  defp tracking_codex_message_handler(recipient, issue) do
+    delegate = codex_message_handler(recipient, issue)
+
+    fn message ->
+      if meaningful_codex_update?(message) do
+        Process.put(:codex_turn_meaningful_activity, true)
+      end
+
+      delegate.(message)
+    end
+  end
+
+  defp meaningful_codex_update?(%{event: event} = message) do
+    case event do
+      :tool_call_completed -> true
+      :tool_call_failed -> true
+      :unsupported_tool_call -> true
+      :notification -> meaningful_codex_notification?(message)
+      _ -> false
+    end
+  end
+
+  defp meaningful_codex_update?(_message), do: false
+
+  defp meaningful_codex_notification?(%{payload: payload}) when is_map(payload) do
+    case Map.get(payload, "method") do
+      "codex/event/exec_command_begin" -> true
+      "codex/event/exec_command_end" -> true
+      "codex/event/exec_command_output_delta" -> true
+      "codex/event/mcp_tool_call_begin" -> true
+      "codex/event/mcp_tool_call_end" -> true
+      "codex/event/token_count" -> true
+      "codex/event/agent_message_delta" -> true
+      "codex/event/agent_message_content_delta" -> true
+      "codex/event/agent_reasoning_delta" -> true
+      "codex/event/reasoning_content_delta" -> true
+      "codex/event/agent_reasoning" -> true
+      "codex/event/task_started" -> true
+      "codex/event/item_started" -> meaningful_item_payload?(payload)
+      "codex/event/item_completed" -> meaningful_item_payload?(payload)
+      _ -> false
+    end
+  end
+
+  defp meaningful_codex_notification?(_message), do: false
+
+  defp meaningful_item_payload?(payload) when is_map(payload) do
+    case get_in(payload, ["params", "msg", "type"]) do
+      "token_count" -> true
+      type when is_binary(type) -> type != "user_message"
+      _ -> false
     end
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+    tracker_issue_label = tracker_issue_label()
+
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the Linear issue is still in an active state.
+    - The previous Codex turn completed normally, but the #{tracker_issue_label} is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+    - If the tracker is Jira, use `jira_issue_update` for issue comments and state transitions.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp tracker_issue_label do
+    case Config.settings!().tracker.kind do
+      "jira" -> "Jira issue"
+      _ -> "Linear issue"
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

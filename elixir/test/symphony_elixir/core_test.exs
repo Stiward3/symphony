@@ -86,6 +86,52 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: nil
+    )
+
+    assert {:error, :missing_jira_base_url} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: "https://example.atlassian.net",
+      tracker_api_email: nil
+    )
+
+    assert {:error, :missing_jira_api_email} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: "https://example.atlassian.net",
+      tracker_api_email: "jira@example.com",
+      tracker_api_token: nil
+    )
+
+    assert {:error, :missing_jira_api_token} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: "https://example.atlassian.net",
+      tracker_api_email: "jira@example.com",
+      tracker_api_token: "jira-token",
+      tracker_project_key: nil,
+      tracker_jql: nil
+    )
+
+    assert {:error, :missing_jira_project_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: "https://example.atlassian.net",
+      tracker_api_email: "jira@example.com",
+      tracker_api_token: "jira-token",
+      tracker_project_key: "PROJ",
+      tracker_project_slug: nil
+    )
+
+    assert :ok = Config.validate!()
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -147,6 +193,31 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     assert Config.settings!().tracker.assignee == env_assignee
+  end
+
+  test "jira credentials resolve from JIRA env vars" do
+    previous_jira_api_token = System.get_env("JIRA_API_TOKEN")
+    previous_jira_email = System.get_env("JIRA_EMAIL")
+
+    on_exit(fn ->
+      restore_env("JIRA_API_TOKEN", previous_jira_api_token)
+      restore_env("JIRA_EMAIL", previous_jira_email)
+    end)
+
+    System.put_env("JIRA_API_TOKEN", "jira-token")
+    System.put_env("JIRA_EMAIL", "jira@example.com")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_api_token: nil,
+      tracker_api_email: nil,
+      tracker_project_key: "PROJ",
+      tracker_project_slug: nil
+    )
+
+    assert Config.settings!().tracker.api_key == "jira-token"
+    assert Config.settings!().tracker.api_email == "jira@example.com"
+    assert :ok = Config.validate!()
   end
 
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
@@ -633,6 +704,108 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
+  test "abnormal worker exit can stop the issue instead of retrying" do
+    issue_id = "issue-stop-on-error"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :StopOnErrorOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      stop_issue_state_on_error: "Blocked"
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-STOP",
+      issue: %Issue{id: issue_id, identifier: "MT-STOP", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "## Symphony blocked run"
+    assert body =~ "moved this issue to `Blocked`"
+    assert body =~ "agent exited: :boom"
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+  end
+
+  test "orchestrator blocks issues with empty descriptions before dispatching codex" do
+    issue_id = "issue-empty-description"
+    orchestrator_name = Module.concat(__MODULE__, :EmptyDescriptionOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    Application.put_env(
+      :symphony_elixir,
+      :memory_tracker_issues,
+      [
+        %Issue{
+          id: issue_id,
+          identifier: "MT-EMPTY",
+          title: "Missing details",
+          description: nil,
+          state: "In Progress",
+          url: "https://example.org/issues/MT-EMPTY",
+          labels: []
+        }
+      ]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "before starting Codex because the issue description is empty"
+    assert body =~ "issue description is empty"
+
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
@@ -1029,6 +1202,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
+            printf '%s\\n' '{\"method\":\"codex/event/task_started\",\"params\":{}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
             ;;
@@ -1114,6 +1288,9 @@ defmodule SymphonyElixir.CoreTest do
               printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               ;;
             4)
+              printf '%s\\n' '{\"method\":\"codex/event/task_started\",\"params\":{}}'
+              ;;
+            5)
               printf '%s\\n' '{\"method\":\"turn/completed\"}'
               ;;
             *)
@@ -1164,6 +1341,85 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner fails when codex completes a turn without meaningful activity" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-noop-turn-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{\"id\":1,\"result\":{}}'
+              ;;
+            2)
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-noop\"}}}'
+              ;;
+            3)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-noop\"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              ;;
+            *)
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-noop-turn",
+        identifier: "MT-100",
+        title: "Detect no-op codex turn",
+        description: "This turn should fail",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-100",
+        labels: ["backend"]
+      }
+
+      assert_raise RuntimeError,
+                   ~r/Agent run failed.*codex_turn_completed_without_meaningful_activity/,
+                   fn ->
+                     AgentRunner.run(
+                       issue,
+                       nil,
+                       issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                     )
+                   end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner continues with a follow-up turn while the issue remains active" do
     test_root =
       Path.join(
@@ -1206,10 +1462,12 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
+            printf '%s\\n' '{"method":"codex/event/task_started","params":{}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
+            printf '%s\\n' '{"method":"codex/event/task_started","params":{}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1336,10 +1594,12 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
+            printf '%s\\n' '{"method":"codex/event/task_started","params":{}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
+            printf '%s\\n' '{"method":"codex/event/task_started","params":{}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1742,6 +2002,74 @@ defmodule SymphonyElixir.CoreTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails the turn when codex emits a stream error before completion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-stream-error-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-199")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-error"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-error"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"codex/event/stream_error","params":{"msg":{"message":"stream exploded"}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-stream-error",
+        identifier: "MT-199",
+        title: "Stream error",
+        description: "Fail on stream errors",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-199",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:codex_stream_error, "codex/event/stream_error", "stream exploded"}} =
+               AppServer.run(workspace, "Fix workspace start args", issue)
     after
       File.rm_rf(test_root)
     end

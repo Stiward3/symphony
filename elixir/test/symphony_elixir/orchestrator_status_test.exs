@@ -101,6 +101,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "transient codex stream errors do not overwrite the last visible status" do
+    issue_id = "issue-stream-error-snapshot"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-189",
+      title: "Stream error snapshot test",
+      description: "Preserve visible status across transient stream errors",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-189"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StreamErrorOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    previous_message = %{
+      event: :notification,
+      message: %{"method" => "codex/event/task_started"},
+      timestamp: started_at
+    }
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-live-turn-live",
+      turn_count: 1,
+      last_codex_message: previous_message,
+      last_codex_timestamp: started_at,
+      last_codex_event: :notification,
+      started_at: started_at
+    }
+
+    state_with_issue =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+
+    :sys.replace_state(pid, fn _ -> state_with_issue end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{"method" => "codex/event/stream_error"},
+         timestamp: now
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.last_codex_event == :notification
+    assert snapshot_entry.last_codex_message == previous_message
+    assert snapshot_entry.last_codex_timestamp == now
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -961,6 +1030,71 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 10_500
   end
 
+  test "orchestrator can move stalled issues to a stop state instead of retrying" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      stop_issue_state_on_error: "Blocked",
+      codex_stall_timeout_ms: 1_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-stall-stop"
+    orchestrator_name = Module.concat(__MODULE__, :StallStopOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-STALL-STOP",
+      issue: %Issue{id: issue_id, identifier: "MT-STALL-STOP", state: "In Progress"},
+      session_id: "thread-stall-stop-turn-stop",
+      last_codex_message: nil,
+      last_codex_timestamp: stale_activity_at,
+      last_codex_event: :notification,
+      started_at: stale_activity_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :tick)
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "## Symphony blocked run"
+    assert body =~ "moved this issue to `Blocked`"
+    assert body =~ "stalled for "
+
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
   test "status dashboard renders offline marker to terminal" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
@@ -985,6 +1119,29 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "https://linear.app/project/project/issues"
     refute rendered =~ "Dashboard:"
+  end
+
+  test "status dashboard renders jira project link in header from tracker config" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_base_url: "https://example.atlassian.net",
+      tracker_project_key: "PRJ00406",
+      tracker_project_slug: nil
+    )
+
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "https://example.atlassian.net/issues/?jql=project+%3D+%22PRJ00406%22"
+    refute rendered =~ "https://linear.app/project/project/issues"
   end
 
   test "status dashboard renders dashboard url on its own line when server port is configured" do

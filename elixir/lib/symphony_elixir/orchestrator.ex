@@ -132,23 +132,14 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              handle_normal_agent_completion(state, issue_id, session_id, running_entry)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              stop_issue_on_error_or_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
@@ -237,6 +228,22 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
+      {:error, :missing_jira_base_url} ->
+        Logger.error("Jira base URL missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_jira_api_email} ->
+        Logger.error("Jira API email missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_jira_api_token} ->
+        Logger.error("Jira API token missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_jira_project_key} ->
+        Logger.error("Jira project key or JQL missing in WORKFLOW.md")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -264,7 +271,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+        Logger.error("Failed to fetch from tracker: #{inspect(reason)}")
         state
 
       false ->
@@ -477,7 +484,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
+      |> stop_issue_on_error_or_retry(issue_id, next_attempt, %{
         identifier: identifier,
         error: "stalled for #{elapsed_ms}ms without codex activity"
       })
@@ -660,7 +667,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case validate_issue_for_dispatch(state, refreshed_issue) do
+          {:ok, valid_issue} ->
+            do_dispatch_issue(state, valid_issue, attempt, preferred_worker_host)
+
+          {:skip, updated_state} ->
+            updated_state
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -762,12 +775,233 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp validate_issue_for_dispatch(%State{} = state, %Issue{} = issue) do
+    if empty_issue_description?(issue) do
+      {:skip, block_issue_for_missing_description(state, issue)}
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp validate_issue_for_dispatch(%State{} = state, _issue), do: {:skip, state}
+
+  defp empty_issue_description?(%Issue{description: description}) when is_binary(description) do
+    String.trim(description) == ""
+  end
+
+  defp empty_issue_description?(%Issue{description: nil}), do: true
+  defp empty_issue_description?(_issue), do: true
+
+  defp block_issue_for_missing_description(
+         %State{} = state,
+         %Issue{id: issue_id, identifier: identifier}
+       )
+       when is_binary(issue_id) do
+    state_name = "Blocked"
+    error = "issue description is empty"
+
+    case Tracker.update_issue_state(issue_id, state_name) do
+      :ok ->
+        body =
+          [
+            "## Symphony blocked run",
+            "",
+            "Symphony moved this issue to `#{state_name}` before starting Codex because the issue description is empty.",
+            "",
+            "Reason: `#{error}`"
+          ]
+          |> Enum.join("\n")
+
+        case Tracker.create_comment(issue_id, body) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning(
+              "Failed to create missing-description comment for issue_id=#{issue_id} issue_identifier=#{identifier}: #{inspect(reason)}"
+            )
+        end
+
+        Logger.warning(
+          "Blocking issue_id=#{issue_id} issue_identifier=#{identifier} before dispatch because description is empty"
+        )
+
+        release_issue_claim(state, issue_id)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to move issue_id=#{issue_id} issue_identifier=#{identifier} to Blocked for missing description: #{inspect(reason)}"
+        )
+
+        release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp block_issue_for_missing_description(%State{} = state, _issue), do: state
+
   defp complete_issue(%State{} = state, issue_id) do
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+  end
+
+  defp handle_normal_agent_completion(%State{} = state, issue_id, session_id, running_entry)
+       when is_binary(issue_id) and is_binary(session_id) and is_map(running_entry) do
+    identifier = Map.get(running_entry, :identifier)
+    worker_host = Map.get(running_entry, :worker_host)
+    workspace_path = Map.get(running_entry, :workspace_path)
+
+    if Workspace.has_changes?(workspace_path, worker_host) do
+      changed_files = Workspace.changed_files(workspace_path, worker_host)
+      move_issue_to_code_review_after_changes(state, issue_id, identifier, session_id, changed_files)
+    else
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: identifier,
+        delay_type: :continuation,
+        worker_host: worker_host,
+        workspace_path: workspace_path
+      })
+    end
+  end
+
+  defp move_issue_to_code_review_after_changes(%State{} = state, issue_id, identifier, session_id, changed_files)
+       when is_binary(issue_id) do
+    state_name = "Code Review"
+
+    case Tracker.update_issue_state(issue_id, state_name) do
+      :ok ->
+        maybe_comment_code_review_stop(issue_id, changed_files)
+
+        Logger.info(
+          "Agent task completed for issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; workspace changed, moved issue to state=#{state_name}"
+        )
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Agent task completed for issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}, but failed to move issue to state=#{state_name}: #{inspect(reason)}; scheduling active-state continuation check"
+        )
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: identifier,
+          delay_type: :continuation
+        })
+    end
+  end
+
+  defp maybe_comment_code_review_stop(issue_id, changed_files) when is_binary(issue_id) do
+    body = code_review_comment_body(changed_files)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create auto-code-review comment for issue_id=#{issue_id}: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp code_review_comment_body(changed_files) when is_list(changed_files) do
+    file_lines =
+      changed_files
+      |> Enum.take(10)
+      |> Enum.map(&"- `#{&1}`")
+
+    file_section =
+      case file_lines do
+        [] -> ["Files changed: unable to determine from workspace status."]
+        lines -> ["Files changed:", ""] ++ lines
+      end
+
+    [
+      "## Symphony moved issue to `Code Review`",
+      "",
+      "Symphony detected completed workspace changes after a successful agent run and moved this issue out of `In Progress`.",
+      ""
+    ] ++ file_section
+    |> Enum.join("\n")
+  end
+
+  defp stop_issue_on_error_or_retry(%State{} = state, issue_id, attempt, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    case Config.settings!().agent.stop_issue_state_on_error do
+      state_name when is_binary(state_name) ->
+        stop_issue_on_error(state, issue_id, state_name, metadata, attempt)
+
+      _ ->
+        schedule_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp stop_issue_on_error(%State{} = state, issue_id, state_name, metadata, attempt)
+       when is_binary(issue_id) and is_binary(state_name) and is_map(metadata) do
+    identifier = metadata[:identifier] || issue_id
+    error = metadata[:error]
+
+    case Tracker.update_issue_state(issue_id, state_name) do
+      :ok ->
+        maybe_comment_error_stop(issue_id, state_name, error)
+
+        error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+
+        Logger.warning(
+          "Stopping retries for issue_id=#{issue_id} issue_identifier=#{identifier}; moved issue to state=#{state_name}#{error_suffix}"
+        )
+
+        release_issue_claim(state, issue_id)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to move issue_id=#{issue_id} issue_identifier=#{identifier} to state=#{state_name} after error: #{inspect(reason)}; scheduling retry"
+        )
+
+        schedule_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp maybe_comment_error_stop(issue_id, state_name, error)
+       when is_binary(issue_id) and is_binary(state_name) do
+    body = error_stop_comment_body(state_name, error)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Failed to create stop-on-error comment for issue_id=#{issue_id} state=#{state_name}: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp error_stop_comment_body(state_name, error) do
+    details =
+      case error do
+        value when is_binary(value) and value != "" -> value
+        _ -> "unknown runtime error"
+      end
+
+    [
+      "## Symphony blocked run",
+      "",
+      "Symphony moved this issue to `#{state_name}` after a runtime failure.",
+      "",
+      "Reason: `#{details}`"
+    ]
+    |> Enum.join("\n")
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
@@ -1169,7 +1403,7 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
-  defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
+  defp integrate_codex_update(running_entry, %{event: _event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -1179,13 +1413,15 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    visible_event = visible_codex_event_for_update(running_entry, update)
+    visible_message = visible_codex_message_for_update(running_entry, update)
 
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+        last_codex_message: visible_message,
         session_id: session_id_for_update(running_entry.session_id, update),
-        last_codex_event: event,
+        last_codex_event: visible_event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1197,6 +1433,45 @@ defmodule SymphonyElixir.Orchestrator do
       }),
       token_delta
     }
+  end
+
+  defp visible_codex_event_for_update(running_entry, update) do
+    if transient_codex_notification?(update) do
+      Map.get(running_entry, :last_codex_event)
+    else
+      update[:event]
+    end
+  end
+
+  defp visible_codex_message_for_update(running_entry, update) do
+    if transient_codex_notification?(update) do
+      Map.get(running_entry, :last_codex_message)
+    else
+      summarize_codex_update(update)
+    end
+  end
+
+  defp transient_codex_notification?(%{event: :notification} = update) do
+    case codex_notification_method(update) do
+      "error" -> true
+      "codex/event/error" -> true
+      "codex/event/stream_error" -> true
+      _ -> false
+    end
+  end
+
+  defp transient_codex_notification?(_update), do: false
+
+  defp codex_notification_method(update) when is_map(update) do
+    payload = Map.get(update, :payload) || Map.get(update, "payload")
+
+    cond do
+      is_map(payload) ->
+        Map.get(payload, "method") || Map.get(payload, :method)
+
+      true ->
+        nil
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})

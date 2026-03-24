@@ -47,8 +47,12 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:kind, :string)
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
+      field(:base_url, :string)
       field(:api_key, :string)
+      field(:api_email, :string)
       field(:project_slug, :string)
+      field(:project_key, :string)
+      field(:jql, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
@@ -59,7 +63,19 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :base_url,
+          :api_key,
+          :api_email,
+          :project_slug,
+          :project_key,
+          :jql,
+          :assignee,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
     end
@@ -131,6 +147,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      field(:stop_issue_state_on_error, :string)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
@@ -139,12 +156,19 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :stop_issue_state_on_error,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> update_change(:stop_issue_state_on_error, &Schema.normalize_optional_string/1)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -366,10 +390,29 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_settings(settings) do
+    tracker_env =
+      case settings.tracker.kind do
+        "jira" ->
+          %{
+            api_key: System.get_env("JIRA_API_TOKEN"),
+            api_email: System.get_env("JIRA_EMAIL"),
+            assignee: System.get_env("JIRA_ASSIGNEE")
+          }
+
+        _ ->
+          %{
+            api_key: System.get_env("LINEAR_API_KEY"),
+            api_email: nil,
+            assignee: System.get_env("LINEAR_ASSIGNEE")
+          }
+      end
+
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+      | api_key: resolve_secret_setting(settings.tracker.api_key, tracker_env.api_key),
+        api_email: resolve_secret_setting(settings.tracker.api_email, tracker_env.api_email),
+        assignee: resolve_secret_setting(settings.tracker.assignee, tracker_env.assignee),
+        base_url: resolve_base_url_value(settings.tracker.base_url)
     }
 
     workspace = %{
@@ -434,6 +477,31 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_base_url_value(nil), do: nil
+
+  defp resolve_base_url_value(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> case do
+      "" -> nil
+      normalized -> String.trim_trailing(normalized, "/")
+    end
+  end
+
+  defp resolve_base_url_value(_value), do: nil
+
+  @doc false
+  def normalize_optional_string(nil), do: nil
+
+  def normalize_optional_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  def normalize_optional_string(_value), do: nil
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do

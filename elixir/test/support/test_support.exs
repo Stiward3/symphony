@@ -11,6 +11,7 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
+      alias SymphonyElixir.Jira.Client, as: JiraClient
       alias SymphonyElixir.Linear.Client
       alias SymphonyElixir.Linear.Issue
       alias SymphonyElixir.Orchestrator
@@ -94,8 +95,12 @@ defmodule SymphonyElixir.TestSupport do
         [
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
+          tracker_base_url: "https://example.atlassian.net",
           tracker_api_token: "token",
+          tracker_api_email: "jira@example.com",
           tracker_project_slug: "project",
+          tracker_project_key: "PROJ",
+          tracker_jql: nil,
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
@@ -106,6 +111,7 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          stop_issue_state_on_error: nil,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
@@ -131,8 +137,12 @@ defmodule SymphonyElixir.TestSupport do
 
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
+    tracker_base_url = Keyword.get(config, :tracker_base_url)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
+    tracker_api_email = Keyword.get(config, :tracker_api_email)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_project_key = Keyword.get(config, :tracker_project_key)
+    tracker_jql = Keyword.get(config, :tracker_jql)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
@@ -143,6 +153,7 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    stop_issue_state_on_error = Keyword.get(config, :stop_issue_state_on_error)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
@@ -169,8 +180,12 @@ defmodule SymphonyElixir.TestSupport do
         "tracker:",
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
+        "  base_url: #{yaml_value(tracker_base_url)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
+        "  api_email: #{yaml_value(tracker_api_email)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
+        "  project_key: #{yaml_value(tracker_project_key)}",
+        "  jql: #{yaml_value(tracker_jql)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
@@ -183,6 +198,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        "  stop_issue_state_on_error: #{yaml_value(stop_issue_state_on_error)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",

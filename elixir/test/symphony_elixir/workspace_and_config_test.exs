@@ -371,6 +371,106 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "jira client normalizes linked blockers and assignee routing" do
+    raw_issue = %{
+      "id" => "10001",
+      "key" => "PROJ-1",
+      "fields" => %{
+        "summary" => "Blocked task",
+        "description" => %{
+          "content" => [
+            %{
+              "type" => "paragraph",
+              "content" => [
+                %{"type" => "text", "text" => "Needs upstream work"}
+              ]
+            }
+          ]
+        },
+        "status" => %{"name" => "To Do"},
+        "priority" => %{"name" => "High"},
+        "labels" => ["Backend"],
+        "assignee" => %{
+          "accountId" => "acct-1",
+          "displayName" => "Dev One",
+          "emailAddress" => "dev@example.com"
+        },
+        "issuelinks" => [
+          %{
+            "type" => %{"name" => "Blocks", "inward" => "is blocked by"},
+            "inwardIssue" => %{
+              "id" => "10002",
+              "key" => "PROJ-2",
+              "fields" => %{"status" => %{"name" => "In Progress"}}
+            }
+          }
+        ],
+        "created" => "2026-01-01T00:00:00.000Z",
+        "updated" => "2026-01-02T00:00:00.000Z"
+      }
+    }
+
+    issue = JiraClient.normalize_issue_for_test(raw_issue, "dev@example.com")
+
+    assert issue.id == "PROJ-1"
+    assert issue.identifier == "PROJ-1"
+    assert issue.description == "Needs upstream work"
+    assert issue.priority == 2
+    assert issue.labels == ["backend"]
+    assert issue.blocked_by == [%{id: "PROJ-2", identifier: "PROJ-2", state: "In Progress"}]
+    assert issue.assignee_id == "acct-1"
+    assert issue.assigned_to_worker
+    assert issue.url == "https://example.atlassian.net/browse/PROJ-1"
+  end
+
+  test "jira client marks issues assigned to someone else as not routed to worker" do
+    raw_issue = %{
+      "id" => "10003",
+      "key" => "PROJ-3",
+      "fields" => %{
+        "summary" => "Other assignee",
+        "status" => %{"name" => "To Do"},
+        "assignee" => %{
+          "accountId" => "acct-2",
+          "displayName" => "Other Dev",
+          "emailAddress" => "other@example.com"
+        }
+      }
+    }
+
+    issue = JiraClient.normalize_issue_for_test(raw_issue, "dev@example.com")
+
+    refute issue.assigned_to_worker
+  end
+
+  test "jira client skips issues whose parent is an epic" do
+    raw_issue = %{
+      "id" => "10004",
+      "key" => "PROJ-4",
+      "fields" => %{
+        "summary" => "Parent-level issue",
+        "description" => "Should not be routed",
+        "status" => %{"name" => "In Progress"},
+        "assignee" => %{
+          "accountId" => "acct-1",
+          "displayName" => "Dev One",
+          "emailAddress" => "dev@example.com"
+        },
+        "parent" => %{
+          "id" => "10000",
+          "key" => "PROJ-1",
+          "fields" => %{
+            "issuetype" => %{"name" => "Epic"}
+          }
+        }
+      }
+    }
+
+    issue = JiraClient.normalize_issue_for_test(raw_issue, "dev@example.com")
+
+    refute issue.assigned_to_worker
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},
@@ -911,6 +1011,34 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
+  end
+
+  test "jira config resolves token and email from JIRA env vars" do
+    token_env_var = "SYMP_JIRA_API_TOKEN_#{System.unique_integer([:positive])}"
+    email_env_var = "SYMP_JIRA_EMAIL_#{System.unique_integer([:positive])}"
+
+    previous_token = System.get_env(token_env_var)
+    previous_email = System.get_env(email_env_var)
+
+    System.put_env(token_env_var, "jira-token")
+    System.put_env(email_env_var, "jira@example.com")
+
+    on_exit(fn ->
+      restore_env(token_env_var, previous_token)
+      restore_env(email_env_var, previous_email)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      tracker_api_token: "$#{token_env_var}",
+      tracker_api_email: "$#{email_env_var}",
+      tracker_project_key: "PROJ",
+      tracker_project_slug: nil
+    )
+
+    assert Config.settings!().tracker.api_key == "jira-token"
+    assert Config.settings!().tracker.api_email == "jira@example.com"
+    assert Config.settings!().tracker.project_key == "PROJ"
   end
 
   test "config no longer resolves legacy env: references" do

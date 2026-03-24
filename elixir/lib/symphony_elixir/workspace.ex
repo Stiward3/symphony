@@ -163,6 +163,76 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
+  @spec has_changes?(Path.t() | nil, worker_host()) :: boolean()
+  def has_changes?(workspace, nil) when is_binary(workspace) do
+    case validate_workspace_path(workspace, nil) do
+      :ok ->
+        case System.cmd("git", ["status", "--porcelain"], cd: workspace, stderr_to_stdout: true) do
+          {output, 0} -> String.trim(output) != ""
+          {_output, _status} -> false
+        end
+
+      {:error, _reason} ->
+        false
+    end
+  rescue
+    _error -> false
+  end
+
+  def has_changes?(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    case validate_workspace_path(workspace, worker_host) do
+      :ok ->
+        script = "cd #{shell_escape(workspace)} && git status --porcelain"
+
+        case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+          {:ok, {output, 0}} -> String.trim(IO.iodata_to_binary(output)) != ""
+          _ -> false
+        end
+
+      {:error, _reason} ->
+        false
+    end
+  rescue
+    _error -> false
+  end
+
+  def has_changes?(_workspace, _worker_host), do: false
+
+  @spec changed_files(Path.t() | nil, worker_host()) :: [String.t()]
+  def changed_files(workspace, nil) when is_binary(workspace) do
+    case validate_workspace_path(workspace, nil) do
+      :ok ->
+        case System.cmd("git", ["status", "--porcelain"], cd: workspace, stderr_to_stdout: true) do
+          {output, 0} -> parse_changed_files(output)
+          {_output, _status} -> []
+        end
+
+      {:error, _reason} ->
+        []
+    end
+  rescue
+    _error -> []
+  end
+
+  def changed_files(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
+    case validate_workspace_path(workspace, worker_host) do
+      :ok ->
+        script = "cd #{shell_escape(workspace)} && git status --porcelain"
+
+        case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+          {:ok, {output, 0}} -> parse_changed_files(output)
+          _ -> []
+        end
+
+      {:error, _reason} ->
+        []
+    end
+  rescue
+    _error -> []
+  end
+
+  def changed_files(_workspace, _worker_host), do: []
+
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
@@ -298,7 +368,8 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        {shell, shell_args} = local_hook_shell(command)
+        System.cmd(shell, shell_args, cd: workspace, stderr_to_stdout: true)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -328,6 +399,16 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp local_hook_shell(command) when is_binary(command) do
+    case :os.type() do
+      {:win32, _} ->
+        {"powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]}
+
+      _ ->
+        {"sh", ["-lc", command]}
     end
   end
 
@@ -451,6 +532,22 @@ defmodule SymphonyElixir.Workspace do
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp parse_changed_files(output) do
+    output
+    |> IO.iodata_to_binary()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim_leading(&1))
+    |> Enum.map(fn line ->
+      case String.split(line, ~r/\s+/, parts: 2) do
+        [_status, path] -> String.trim(path)
+        [path] -> String.trim(path)
+        _ -> nil
+      end
+    end)
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
   end
 
   defp worker_host_for_log(nil), do: "local"
