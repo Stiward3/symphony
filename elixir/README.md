@@ -65,6 +65,39 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+## Run From WSL
+
+If you are working from a Windows checkout and need Codex/Symphony to run inside WSL, launch it
+from the mounted repo path instead of from PowerShell. This is the setup that has worked well for
+local Jira runs:
+
+```bash
+cd /mnt/c/Workspace/symphony/symphony/elixir
+mise trust
+mise install
+mise exec -- mix setup
+mix build
+escript ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails ./WORKFLOW.md
+```
+
+Useful notes for WSL:
+
+- Export tracker credentials in the same WSL shell before launching Symphony, for example
+  `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, and `JIRA_PROJECT_KEY` for Jira workflows.
+- If `server.port` is set in `WORKFLOW.md`, the observability dashboard is available at
+  `http://127.0.0.1:<port>/` from Windows while Symphony keeps running in WSL.
+- If Codex asks you to sign in, complete that login from WSL before starting Symphony so the
+  app-server session can execute normally.
+
+Example Jira environment setup in WSL:
+
+```bash
+export JIRA_BASE_URL="https://your-company.atlassian.net/rest/api/3"
+export JIRA_EMAIL="your-email@company.com"
+export JIRA_API_TOKEN="your-jira-api-token"
+export JIRA_PROJECT_KEY="ABC"
+```
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
