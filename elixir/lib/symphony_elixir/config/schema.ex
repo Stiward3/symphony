@@ -482,6 +482,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp resolve_base_url_value(value) when is_binary(value) do
     value
+    |> resolve_env_value(nil)
     |> String.trim()
     |> case do
       "" -> nil

@@ -89,7 +89,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       end)
 
     Logger.info(
-      "Starting Codex turn for #{issue_context(issue)} description_present=#{issue_description_present?(issue)} prompt_chars=#{String.length(prompt)} prompt_preview=#{inspect(prompt_preview(prompt))}"
+      "Starting Codex turn for #{issue_context(issue)} description_present=#{issue_description_present?(issue)} description_chars=#{issue_description_chars(issue)} prompt_chars=#{String.length(prompt)} prompt_overhead_chars=#{max(String.length(prompt) - issue_description_chars(issue), 0)} prompt_preview=#{inspect(prompt_preview(prompt))}"
     )
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -1170,6 +1170,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp issue_description_present?(_issue), do: false
+
+  defp issue_description_chars(%{description: description}) when is_binary(description) do
+    description
+    |> String.trim()
+    |> String.length()
+  end
+
+  defp issue_description_chars(_issue), do: 0
 
   defp prompt_preview(prompt) when is_binary(prompt) do
     prompt

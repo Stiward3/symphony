@@ -1016,26 +1016,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "jira config resolves token and email from JIRA env vars" do
     token_env_var = "SYMP_JIRA_API_TOKEN_#{System.unique_integer([:positive])}"
     email_env_var = "SYMP_JIRA_EMAIL_#{System.unique_integer([:positive])}"
+    base_url_env_var = "SYMP_JIRA_BASE_URL_#{System.unique_integer([:positive])}"
 
     previous_token = System.get_env(token_env_var)
     previous_email = System.get_env(email_env_var)
+    previous_base_url = System.get_env(base_url_env_var)
 
     System.put_env(token_env_var, "jira-token")
     System.put_env(email_env_var, "jira@example.com")
+    System.put_env(base_url_env_var, "https://jira.example.com/rest/api/3/")
 
     on_exit(fn ->
       restore_env(token_env_var, previous_token)
       restore_env(email_env_var, previous_email)
+      restore_env(base_url_env_var, previous_base_url)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "jira",
+      tracker_base_url: "$#{base_url_env_var}",
       tracker_api_token: "$#{token_env_var}",
       tracker_api_email: "$#{email_env_var}",
       tracker_project_key: "PROJ",
       tracker_project_slug: nil
     )
 
+    assert Config.settings!().tracker.base_url == "https://jira.example.com/rest/api/3"
     assert Config.settings!().tracker.api_key == "jira-token"
     assert Config.settings!().tracker.api_email == "jira@example.com"
     assert Config.settings!().tracker.project_key == "PROJ"

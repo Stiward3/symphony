@@ -363,7 +363,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
-      active_issue_state?(issue.state, active_states) ->
+      active_issue_state?(issue.state, active_states) or continuation_issue_state?(issue.state) ->
         refresh_running_issue_state(state, issue)
 
       true ->
@@ -669,7 +669,20 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %Issue{} = refreshed_issue} ->
         case validate_issue_for_dispatch(state, refreshed_issue) do
           {:ok, valid_issue} ->
-            do_dispatch_issue(state, valid_issue, attempt, preferred_worker_host)
+            case ensure_issue_ready_transitioned_for_dispatch(valid_issue) do
+              {:ok, dispatchable_issue} ->
+                do_dispatch_issue(state, dispatchable_issue, attempt, preferred_worker_host)
+
+              {:error, reason} ->
+                Logger.warning(
+                  "Skipping dispatch; failed to confirm Ready -> In Progress transition for #{issue_context(valid_issue)}: #{inspect(reason)}"
+                )
+
+                stop_issue_on_error_or_retry(state, valid_issue.id, 1, %{
+                  identifier: valid_issue.identifier,
+                  error: "failed to confirm transition to In Progress before dispatch: #{inspect(reason)}"
+                })
+            end
 
           {:skip, updated_state} ->
             updated_state
@@ -775,6 +788,49 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
+  defp ensure_issue_ready_transitioned_for_dispatch(%Issue{} = issue) do
+    if normalize_issue_state(issue.state) == "ready" do
+      case fetch_issue_state_for_runtime(issue.id) do
+        {:ok, %Issue{} = refreshed_issue} ->
+          if continuation_issue_state?(refreshed_issue.state) do
+            {:ok, refreshed_issue}
+          else
+            with :ok <- Tracker.update_issue_state(issue.id, "In Progress"),
+                 {:ok, %Issue{} = updated_issue} <- fetch_issue_state_for_runtime(issue.id),
+                 true <- continuation_issue_state?(updated_issue.state) do
+              {:ok, updated_issue}
+            else
+              false -> {:error, :issue_not_in_progress_after_dispatch_transition}
+              {:error, reason} -> {:error, reason}
+              _ -> {:error, :issue_not_in_progress_after_dispatch_transition}
+            end
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp ensure_issue_ready_transitioned_for_dispatch(issue), do: {:ok, issue}
+
+  defp fetch_issue_state_for_runtime(issue_id) when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> {:ok, refreshed_issue}
+      {:ok, []} -> {:error, :issue_not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp continuation_issue_state?(state_name) when is_binary(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+    normalized_state == "in progress" or MapSet.member?(active_state_set(), normalized_state)
+  end
+
+  defp continuation_issue_state?(_state_name), do: false
+
   defp validate_issue_for_dispatch(%State{} = state, %Issue{} = issue) do
     if empty_issue_description?(issue) do
       {:skip, block_issue_for_missing_description(state, issue)}
@@ -853,20 +909,48 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = Map.get(running_entry, :worker_host)
     workspace_path = Map.get(running_entry, :workspace_path)
 
-    if Workspace.has_changes?(workspace_path, worker_host) do
-      changed_files = Workspace.changed_files(workspace_path, worker_host)
-      move_issue_to_code_review_after_changes(state, issue_id, identifier, session_id, changed_files)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    case fetch_issue_state_for_runtime(issue_id) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        cond do
+          not continuation_issue_state?(refreshed_issue.state) ->
+            Logger.info(
+              "Agent task completed for issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; issue state=#{inspect(refreshed_issue.state)} is no longer continuation-eligible"
+            )
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: identifier,
-        delay_type: :continuation,
-        worker_host: worker_host,
-        workspace_path: workspace_path
-      })
+            state
+            |> complete_issue(issue_id)
+            |> release_issue_claim(issue_id)
+
+          Workspace.has_changes?(workspace_path, worker_host) ->
+            changed_files = Workspace.changed_files(workspace_path, worker_host)
+            move_issue_to_code_review_after_changes(state, issue_id, identifier, session_id, changed_files)
+
+          true ->
+            Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+            state
+            |> complete_issue(issue_id)
+            |> schedule_issue_retry(issue_id, 1, %{
+              identifier: identifier,
+              delay_type: :continuation,
+              worker_host: worker_host,
+              workspace_path: workspace_path
+            })
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "Agent task completed for issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}, but failed to refresh live Jira state: #{inspect(reason)}"
+        )
+
+        state
+        |> complete_issue(issue_id)
+        |> stop_issue_on_error_or_retry(issue_id, 1, %{
+          identifier: identifier,
+          error: "failed to refresh live Jira state after normal completion: #{inspect(reason)}",
+          worker_host: worker_host,
+          workspace_path: workspace_path
+        })
     end
   end
 

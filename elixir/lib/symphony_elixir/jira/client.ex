@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Jira.Client do
 
   @search_page_size 50
   @max_error_body_log_bytes 1_000
+  @workpad_comment_header "## Codex Workpad"
   @search_fields [
     "summary",
     "description",
@@ -73,8 +74,7 @@ defmodule SymphonyElixir.Jira.Client do
       when is_binary(issue_id) and is_binary(body) and is_list(opts) do
     request_fun = Keyword.get(opts, :request_fun, &request/4)
 
-    with {:ok, response} <-
-           request_fun.(:post, "issue/#{issue_id}/comment", %{"body" => body}, []),
+    with {:ok, response} <- upsert_comment_request(issue_id, body, request_fun),
          true <- response.status in [200, 201] do
       :ok
     else
@@ -83,6 +83,107 @@ defmodule SymphonyElixir.Jira.Client do
       _ -> {:error, :comment_create_failed}
     end
   end
+
+  defp jira_comment_payload(body) when is_binary(body) do
+    %{
+      "body" => %{
+        "type" => "doc",
+        "version" => 1,
+        "content" => comment_paragraphs(body)
+      }
+    }
+  end
+
+  defp comment_paragraphs(body) when is_binary(body) do
+    body
+    |> String.split(~r/
+?
+
+?
+/, trim: false)
+    |> Enum.map(&String.trim_trailing/1)
+    |> Enum.reject(&(&1 == ""))
+    |> case do
+      [] -> [comment_paragraph("")]
+      paragraphs -> Enum.map(paragraphs, &comment_paragraph/1)
+    end
+  end
+
+  defp comment_paragraph(text) when is_binary(text) do
+    %{
+      "type" => "paragraph",
+      "content" => [
+        %{
+          "type" => "text",
+          "text" => text
+        }
+      ]
+    }
+  end
+
+  defp upsert_comment_request(issue_id, body, request_fun)
+       when is_binary(issue_id) and is_binary(body) and is_function(request_fun, 4) do
+    payload = jira_comment_payload(body)
+
+    if workpad_comment?(body) do
+      case find_existing_workpad_comment_id(issue_id, request_fun) do
+        {:ok, comment_id} ->
+          request_fun.(:put, "issue/#{issue_id}/comment/#{comment_id}", payload, [])
+
+        {:error, :workpad_comment_not_found} ->
+          request_fun.(:post, "issue/#{issue_id}/comment", payload, [])
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      request_fun.(:post, "issue/#{issue_id}/comment", payload, [])
+    end
+  end
+
+  defp find_existing_workpad_comment_id(issue_id, request_fun)
+       when is_binary(issue_id) and is_function(request_fun, 4) do
+    with {:ok, response} <- request_fun.(:get, "issue/#{issue_id}/comment", nil, []),
+         true <- response.status == 200,
+         comments when is_list(comments) <- Map.get(response.body, "comments"),
+         comment_id when is_binary(comment_id) <- latest_workpad_comment_id(comments) do
+      {:ok, comment_id}
+    else
+      false -> {:error, :comment_lookup_failed}
+      {:error, reason} -> {:error, reason}
+      nil -> {:error, :workpad_comment_not_found}
+      _ -> {:error, :comment_lookup_failed}
+    end
+  end
+
+  defp latest_workpad_comment_id(comments) when is_list(comments) do
+    comments
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{"id" => id, "body" => comment_body} when is_binary(id) ->
+        if workpad_comment_body?(comment_body), do: id
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp workpad_comment?(body) when is_binary(body) do
+    String.contains?(body, @workpad_comment_header)
+  end
+
+  defp workpad_comment_body?(body) when is_binary(body) do
+    String.contains?(body, @workpad_comment_header)
+  end
+
+  defp workpad_comment_body?(body) when is_map(body) do
+    case extract_description(body) do
+      description when is_binary(description) -> String.contains?(description, @workpad_comment_header)
+      _ -> false
+    end
+  end
+
+  defp workpad_comment_body?(_body), do: false
 
   @spec update_issue_state(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name, opts \\ [])
@@ -171,8 +272,8 @@ defmodule SymphonyElixir.Jira.Client do
     end
   end
 
-  @spec request(:get | :post, String.t(), map() | nil, keyword()) :: request_result()
-  def request(method, path, body, _opts \\ []) when method in [:get, :post] and is_binary(path) do
+  @spec request(:get | :post | :put, String.t(), map() | nil, keyword()) :: request_result()
+  def request(method, path, body, _opts \\ []) when method in [:get, :post, :put] and is_binary(path) do
     case request_headers() do
       {:ok, headers} ->
         url = request_url(Config.settings!().tracker.base_url, path)
@@ -480,31 +581,80 @@ defmodule SymphonyElixir.Jira.Client do
     with {:ok, response} <- request_fun.(:get, "issue/#{issue_id}/transitions", nil, []),
          true <- response.status == 200,
          transitions when is_list(transitions) <- Map.get(response.body, "transitions"),
-         transition_id when is_binary(transition_id) <- find_transition_id(transitions, state_name) do
+         %{"id" => transition_id} = transition when is_binary(transition_id) <- find_transition(transitions, state_name) do
+      log_resolved_transition(issue_id, state_name, transition)
       {:ok, transition_id}
     else
       false -> {:error, :issue_update_failed}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :state_not_found}
+      _ ->
+        log_missing_transition(issue_id, state_name, response_transition_names(request_fun, issue_id))
+        {:error, :state_not_found}
     end
   end
 
-  defp find_transition_id(transitions, state_name) when is_list(transitions) and is_binary(state_name) do
+  defp find_transition(transitions, state_name) when is_list(transitions) and is_binary(state_name) do
     wanted = normalize_state_name(state_name)
 
-    Enum.find_value(transitions, fn
-      %{"id" => id, "name" => name} ->
-        if normalize_state_name(name) == wanted, do: id
-
-      %{"id" => id, "to" => %{"name" => name}} ->
-        if normalize_state_name(name) == wanted, do: id
+    Enum.find(transitions, fn
+      %{} = transition ->
+        transition_matches_state?(transition, wanted)
 
       _ ->
-        nil
+        false
     end)
   end
 
-  defp find_transition_id(_transitions, _state_name), do: nil
+  defp find_transition(_transitions, _state_name), do: nil
+
+  defp transition_matches_state?(%{} = transition, wanted) when is_binary(wanted) do
+    action_name = transition["name"] |> to_string_or_empty() |> normalize_state_name()
+    to_state_name = get_in(transition, ["to", "name"]) |> to_string_or_empty() |> normalize_state_name()
+
+    action_name == wanted or to_state_name == wanted
+  end
+
+  defp log_resolved_transition(issue_id, state_name, transition)
+       when is_binary(issue_id) and is_binary(state_name) and is_map(transition) do
+    Logger.info(
+      "Jira transition resolved issue_id=#{issue_id} requested_state=#{inspect(state_name)} transition_id=#{inspect(transition["id"])} transition=#{inspect(transition["name"])} -> #{inspect(get_in(transition, ["to", "name"]))}"
+    )
+  end
+
+  defp log_missing_transition(issue_id, state_name, transition_names)
+       when is_binary(issue_id) and is_binary(state_name) and is_list(transition_names) do
+    Logger.warning(
+      "Jira transition target not found issue_id=#{issue_id} requested_state=#{inspect(state_name)} available_transitions=#{inspect(transition_names)}"
+    )
+  end
+
+  defp response_transition_names(request_fun, issue_id)
+       when is_function(request_fun, 4) and is_binary(issue_id) do
+    case request_fun.(:get, "issue/#{issue_id}/transitions", nil, []) do
+      {:ok, %{status: 200, body: %{"transitions" => transitions}}} when is_list(transitions) ->
+        transition_names(transitions)
+
+      _ ->
+        []
+    end
+  end
+
+  defp transition_names(transitions) when is_list(transitions) do
+    Enum.map(transitions, fn
+      %{} = transition ->
+        action_name = transition["name"] |> to_string_or_empty()
+        to_state_name = get_in(transition, ["to", "name"]) |> to_string_or_empty()
+
+        cond do
+          action_name != "" and to_state_name != "" -> "#{action_name} -> #{to_state_name}"
+          action_name != "" -> action_name
+          to_state_name != "" -> to_state_name
+          true -> inspect(transition)
+        end
+
+      transition -> inspect(transition)
+    end)
+  end
 
   defp sort_issues_by_requested_ids({:ok, issues}, ids) when is_list(issues) do
     order =
@@ -530,8 +680,8 @@ defmodule SymphonyElixir.Jira.Client do
     String.trim_trailing(base_url, "/") <> "/" <> String.trim_leading(path, "/")
   end
 
-  defp maybe_put_body(opts, :post, nil), do: Keyword.put(opts, :json, %{})
-  defp maybe_put_body(opts, :post, body), do: Keyword.put(opts, :json, body)
+  defp maybe_put_body(opts, method, nil) when method in [:post, :put], do: Keyword.put(opts, :json, %{})
+  defp maybe_put_body(opts, method, body) when method in [:post, :put], do: Keyword.put(opts, :json, body)
   defp maybe_put_body(opts, _method, _body), do: opts
 
   defp issue_browse_url(key) when is_binary(key) do

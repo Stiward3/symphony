@@ -368,6 +368,109 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
   end
 
+  test "jira client creates comments using Atlassian document format" do
+    test_pid = self()
+
+    assert :ok =
+             SymphonyElixir.Jira.Client.create_comment(
+               "RDSP-219",
+               "Test comment",
+               request_fun: fn method, path, payload, headers ->
+                 send(test_pid, {:jira_request, method, path, payload, headers})
+                 {:ok, %{status: 201, body: %{}}}
+               end
+             )
+
+    assert_received {:jira_request, :post, "issue/RDSP-219/comment", payload, []}
+
+    assert payload == %{
+             "body" => %{
+               "type" => "doc",
+               "version" => 1,
+               "content" => [
+                 %{
+                   "type" => "paragraph",
+                   "content" => [
+                     %{
+                       "type" => "text",
+                       "text" => "Test comment"
+                     }
+                   ]
+                 }
+               ]
+             }
+           }
+  end
+
+  test "jira client updates the existing Codex workpad comment instead of posting a duplicate" do
+    test_pid = self()
+
+    assert :ok =
+             SymphonyElixir.Jira.Client.create_comment(
+               "RDSP-219",
+               "## Codex Workpad
+
+Updated workpad",
+               request_fun: fn
+                 :get, "issue/RDSP-219/comment", nil, [] ->
+                   send(test_pid, :jira_comment_lookup)
+
+                   {:ok,
+                    %{
+                      status: 200,
+                      body: %{
+                        "comments" => [
+                          %{"id" => "606731", "body" => "Not the workpad"},
+                          %{
+                            "id" => "606732",
+                            "body" => %{
+                              "type" => "doc",
+                              "version" => 1,
+                              "content" => [
+                                %{
+                                  "type" => "paragraph",
+                                  "content" => [
+                                    %{"type" => "text", "text" => "## Codex Workpad"}
+                                  ]
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      }
+                    }}
+
+                 :put, "issue/RDSP-219/comment/606732", payload, [] ->
+                   send(test_pid, {:jira_comment_update, payload})
+                   {:ok, %{status: 200, body: %{}}}
+               end
+             )
+
+    assert_received :jira_comment_lookup
+    assert_received {:jira_comment_update, updated_payload}
+
+    assert updated_payload == %{
+             "body" => %{
+               "type" => "doc",
+               "version" => 1,
+               "content" => [
+                 %{
+                   "type" => "paragraph",
+                   "content" => [
+                     %{"type" => "text", "text" => "## Codex Workpad"}
+                   ]
+                 },
+                 %{
+                   "type" => "paragraph",
+                   "content" => [
+                     %{"type" => "text", "text" => "Updated workpad"}
+                   ]
+                 }
+               ]
+             }
+           }
+  end
+
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
