@@ -1,0 +1,34 @@
+{
+  "fields": {
+    "project": {
+      "key": "RDSP"
+    },
+    "summary": "Symphony Build test",
+    "description": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Build a Json mock that will be inserted in Jira via the api"
+            }
+          ]
+        }
+      ]
+    },
+    "issuetype": {
+      "name": "Task"
+    },
+    "labels": [
+      "symphony",
+      "build-test",
+      "jira-api-mock"
+    ],
+    "priority": {
+      "name": "Medium"
+    }
+  }
+}
