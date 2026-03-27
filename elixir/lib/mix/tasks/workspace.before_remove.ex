@@ -12,10 +12,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
 
       mix workspace.before_remove
       mix workspace.before_remove --branch feature/my-branch
-      mix workspace.before_remove --repo openai/symphony
+      mix workspace.before_remove --repo Stiward3/symphony
   """
 
-  @default_repo "openai/symphony"
+  @default_repo "Stiward3/symphony"
 
   @impl Mix.Task
   def run(args) do
@@ -33,7 +33,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
         Mix.raise("Invalid option(s): #{inspect(invalid)}")
 
       true ->
-        repo = opts[:repo] || @default_repo
+        repo = opts[:repo] || origin_repo() || @default_repo
         branch = opts[:branch] || current_branch()
 
         maybe_close_open_pull_requests(repo, branch)
@@ -121,6 +121,37 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
         end
 
       {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp origin_repo do
+    case run_command("git", ["remote", "get-url", "origin"]) do
+      {:ok, output} ->
+        output
+        |> String.trim()
+        |> repo_from_remote_url()
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp repo_from_remote_url(""), do: nil
+
+  defp repo_from_remote_url(url) do
+    cond do
+      String.starts_with?(url, "git@github.com:") ->
+        url
+        |> String.replace_prefix("git@github.com:", "")
+        |> String.trim_trailing(".git")
+
+      String.starts_with?(url, "https://github.com/") ->
+        url
+        |> String.replace_prefix("https://github.com/", "")
+        |> String.trim_trailing(".git")
+
+      true ->
         nil
     end
   end

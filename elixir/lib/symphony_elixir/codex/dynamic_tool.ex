@@ -30,6 +30,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @jira_issue_update_description """
   Create a Jira comment and/or transition a Jira issue using Symphony's configured Jira auth.
   """
+  @github_delivery_tool "github_delivery"
+  @github_delivery_description """
+  Commit workspace changes, push the current branch to origin, and create or update the corresponding GitHub pull request using Symphony's host environment.
+  """
   @jira_issue_update_input_schema %{
     "type" => "object",
     "additionalProperties" => false,
@@ -49,6 +53,30 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
+  @github_delivery_input_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["commitMessage", "prTitle"],
+    "properties" => %{
+      "commitMessage" => %{
+        "type" => "string",
+        "description" => "Full git commit message to use for the delivery commit."
+      },
+      "prTitle" => %{
+        "type" => "string",
+        "description" => "Pull request title."
+      },
+      "prBody" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional pull request body markdown."
+      },
+      "paths" => %{
+        "type" => ["array", "null"],
+        "description" => "Optional list of repo-relative paths to stage. When omitted, all workspace changes are staged.",
+        "items" => %{"type" => "string"}
+      }
+    }
+  }
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
@@ -58,6 +86,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
       @jira_issue_update_tool ->
         execute_jira_issue_update(arguments, opts)
+
+      @github_delivery_tool ->
+        execute_github_delivery(arguments, opts)
 
       other ->
         failure_response(%{
@@ -78,6 +109,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
             "name" => @jira_issue_update_tool,
             "description" => @jira_issue_update_description,
             "inputSchema" => @jira_issue_update_input_schema
+          },
+          %{
+            "name" => @github_delivery_tool,
+            "description" => @github_delivery_description,
+            "inputSchema" => @github_delivery_input_schema
           }
         ]
 
@@ -117,6 +153,37 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "issueId" => issue_id,
         "commentCreated" => is_binary(comment),
         "stateUpdated" => state_name
+      }
+      |> success_response()
+    else
+      {:error, reason} ->
+        failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_github_delivery(arguments, opts) do
+    command_runner = Keyword.get(opts, :command_runner, &default_command_runner/3)
+    executable_finder = Keyword.get(opts, :executable_finder, &System.find_executable/1)
+    workspace = Keyword.get(opts, :workspace)
+
+    with {:ok, workspace} <- normalize_workspace(workspace),
+         {:ok, commit_message, pr_title, pr_body, paths} <-
+           normalize_github_delivery_arguments(arguments),
+         {:ok, _git_path} <- ensure_executable_available("git", executable_finder),
+         {:ok, _gh_path} <- ensure_executable_available("gh", executable_finder),
+         :ok <- stage_github_delivery_changes(workspace, paths, command_runner),
+         {:ok, changed?} <- workspace_has_changes?(workspace, command_runner),
+         :ok <- ensure_github_delivery_changes(changed?),
+         {:ok, commit_sha} <- create_github_delivery_commit(workspace, commit_message, command_runner),
+         {:ok, branch} <- current_branch(workspace, command_runner),
+         :ok <- push_current_branch(workspace, command_runner),
+         {:ok, pr_result} <- ensure_pull_request(workspace, branch, pr_title, pr_body, command_runner),
+         {:ok, repo_url} <- origin_url(workspace, command_runner) do
+      %{
+        "branch" => branch,
+        "commitSha" => commit_sha,
+        "pr" => pr_result,
+        "repoUrl" => repo_url
       }
       |> success_response()
     else
@@ -170,6 +237,42 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp normalize_jira_issue_update_arguments(_arguments), do: {:error, :invalid_jira_issue_update_arguments}
 
+  defp normalize_github_delivery_arguments(arguments) when is_map(arguments) do
+    commit_message =
+      Map.get(arguments, "commitMessage") ||
+        Map.get(arguments, :commitMessage) ||
+        Map.get(arguments, "commit_message") ||
+        Map.get(arguments, :commit_message)
+
+    pr_title =
+      Map.get(arguments, "prTitle") ||
+        Map.get(arguments, :prTitle) ||
+        Map.get(arguments, "pr_title") ||
+        Map.get(arguments, :pr_title)
+
+    pr_body =
+      Map.get(arguments, "prBody") ||
+        Map.get(arguments, :prBody) ||
+        Map.get(arguments, "pr_body") ||
+        Map.get(arguments, :pr_body)
+
+    paths =
+      Map.get(arguments, "paths") ||
+        Map.get(arguments, :paths)
+
+    with {:ok, normalized_commit_message} <-
+           normalize_required_string(commit_message, :missing_github_delivery_commit_message),
+         {:ok, normalized_pr_title} <-
+           normalize_required_string(pr_title, :missing_github_delivery_pr_title),
+         {:ok, normalized_pr_body} <-
+           normalize_optional_string(pr_body, :invalid_github_delivery_arguments),
+         {:ok, normalized_paths} <- normalize_optional_path_list(paths) do
+      {:ok, normalized_commit_message, normalized_pr_title, normalized_pr_body, normalized_paths}
+    end
+  end
+
+  defp normalize_github_delivery_arguments(_arguments), do: {:error, :invalid_github_delivery_arguments}
+
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
       query when is_binary(query) ->
@@ -210,6 +313,36 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp normalize_optional_string(_value), do: {:error, :invalid_jira_issue_update_arguments}
 
+  defp normalize_optional_string(nil, _error_reason), do: {:ok, nil}
+
+  defp normalize_optional_string(value, _error_reason) when is_binary(value) do
+    case String.trim(value) do
+      "" -> {:ok, nil}
+      normalized -> {:ok, normalized}
+    end
+  end
+
+  defp normalize_optional_string(_value, error_reason), do: {:error, error_reason}
+
+  defp normalize_optional_path_list(nil), do: {:ok, nil}
+
+  defp normalize_optional_path_list(paths) when is_list(paths) do
+    normalized_paths =
+      Enum.reduce_while(paths, [], fn path, acc ->
+        case normalize_required_string(path, :invalid_github_delivery_arguments) do
+          {:ok, normalized_path} -> {:cont, [normalized_path | acc]}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    case normalized_paths do
+      {:error, reason} -> {:error, reason}
+      paths -> {:ok, Enum.reverse(paths)}
+    end
+  end
+
+  defp normalize_optional_path_list(_paths), do: {:error, :invalid_github_delivery_arguments}
+
   defp ensure_jira_issue_update_action(nil, nil), do: {:error, :missing_jira_issue_update_action}
   defp ensure_jira_issue_update_action(_comment, _state), do: :ok
 
@@ -232,6 +365,185 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp maybe_update_jira_state(_issue_id, nil, _update_issue_state), do: :ok
+
+  defp stage_github_delivery_changes(workspace, nil, command_runner) do
+    case run_command(command_runner, "git", ["add", "-A"], workspace) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_stage_failed, reason}}
+    end
+  end
+
+  defp stage_github_delivery_changes(workspace, paths, command_runner) when is_list(paths) do
+    case run_command(command_runner, "git", ["add", "--" | paths], workspace) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_stage_failed, reason}}
+    end
+  end
+
+  defp workspace_has_changes?(workspace, command_runner) do
+    case run_command(command_runner, "git", ["status", "--porcelain"], workspace) do
+      {:ok, output} -> {:ok, String.trim(output) != ""}
+      {:error, reason} -> {:error, {:github_delivery_status_failed, reason}}
+    end
+  end
+
+  defp ensure_github_delivery_changes(true), do: :ok
+  defp ensure_github_delivery_changes(false), do: {:error, :github_delivery_no_changes}
+
+  defp create_github_delivery_commit(workspace, commit_message, command_runner) do
+    commit_file =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-github-delivery-#{System.unique_integer([:positive, :monotonic])}.txt"
+      )
+
+    try do
+      File.write!(commit_file, commit_message)
+
+      case run_command(command_runner, "git", ["commit", "-F", commit_file], workspace) do
+        {:ok, _output} -> current_commit_sha(workspace, command_runner)
+        {:error, reason} -> {:error, {:github_delivery_commit_failed, reason}}
+      end
+    rescue
+      error in [File.Error] ->
+        {:error, {:github_delivery_commit_failed, Exception.message(error)}}
+    after
+      File.rm(commit_file)
+    end
+  end
+
+  defp current_commit_sha(workspace, command_runner) do
+    case run_command(command_runner, "git", ["rev-parse", "HEAD"], workspace) do
+      {:ok, output} -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, {:github_delivery_rev_parse_failed, reason}}
+    end
+  end
+
+  defp current_branch(workspace, command_runner) do
+    case run_command(command_runner, "git", ["branch", "--show-current"], workspace) do
+      {:ok, output} ->
+        case String.trim(output) do
+          "" -> {:error, :github_delivery_missing_branch}
+          branch -> {:ok, branch}
+        end
+
+      {:error, reason} ->
+        {:error, {:github_delivery_branch_failed, reason}}
+    end
+  end
+
+  defp push_current_branch(workspace, command_runner) do
+    case run_command(command_runner, "git", ["push", "-u", "origin", "HEAD"], workspace) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_push_failed, reason}}
+    end
+  end
+
+  defp ensure_pull_request(workspace, branch, pr_title, pr_body, command_runner) do
+    case view_pull_request(workspace, command_runner) do
+      {:ok, %{"state" => state} = payload} when state in ["CLOSED", "MERGED"] ->
+        {:error, {:github_delivery_closed_pr, Map.get(payload, "url")}}
+
+      {:ok, %{"url" => url}} ->
+        with :ok <- update_pull_request(workspace, pr_title, pr_body, command_runner) do
+          {:ok, %{"action" => "updated", "url" => url}}
+        end
+
+      {:error, {:command_failed, _message, 1}} ->
+        create_pull_request(workspace, branch, pr_title, pr_body, command_runner)
+
+      {:error, reason} ->
+        {:error, {:github_delivery_pr_view_failed, reason}}
+    end
+  end
+
+  defp view_pull_request(workspace, command_runner) do
+    with {:ok, output} <-
+           run_command(
+             command_runner,
+             "gh",
+             ["pr", "view", "--json", "state,url"],
+             workspace
+           ) do
+      case Jason.decode(output) do
+        {:ok, payload} -> {:ok, payload}
+        {:error, error} -> {:error, Exception.message(error)}
+      end
+    end
+  end
+
+  defp update_pull_request(workspace, pr_title, pr_body, command_runner) do
+    args =
+      ["pr", "edit", "--title", pr_title] ++
+        maybe_pr_body_args(pr_body)
+
+    case run_command(command_runner, "gh", args, workspace) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_pr_edit_failed, reason}}
+    end
+  end
+
+  defp create_pull_request(workspace, branch, pr_title, pr_body, command_runner) do
+    args =
+      ["pr", "create", "--head", branch, "--title", pr_title] ++
+        maybe_pr_body_args(pr_body)
+
+    with {:ok, _output} <- run_command(command_runner, "gh", args, workspace),
+         {:ok, %{"url" => url}} <- view_pull_request(workspace, command_runner) do
+      {:ok, %{"action" => "created", "url" => url}}
+    else
+      {:error, reason} -> {:error, {:github_delivery_pr_create_failed, reason}}
+    end
+  end
+
+  defp maybe_pr_body_args(nil), do: []
+
+  defp maybe_pr_body_args(pr_body) when is_binary(pr_body) do
+    ["--body", pr_body]
+  end
+
+  defp origin_url(workspace, command_runner) do
+    case run_command(command_runner, "git", ["remote", "get-url", "origin"], workspace) do
+      {:ok, output} -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, {:github_delivery_origin_failed, reason}}
+    end
+  end
+
+  defp ensure_executable_available(command, executable_finder)
+       when is_binary(command) and is_function(executable_finder, 1) do
+    case executable_finder.(command) do
+      path when is_binary(path) and path != "" -> {:ok, path}
+      _ -> {:error, {:missing_executable, command}}
+    end
+  end
+
+  defp normalize_workspace(workspace) when is_binary(workspace) do
+    case String.trim(workspace) do
+      "" -> {:error, :missing_github_delivery_workspace}
+      normalized -> {:ok, normalized}
+    end
+  end
+
+  defp normalize_workspace(_workspace), do: {:error, :missing_github_delivery_workspace}
+
+  defp run_command(command_runner, command, args, workspace)
+       when is_function(command_runner, 3) and is_binary(command) and is_list(args) and
+              is_binary(workspace) do
+    case command_runner.(command, args, cd: workspace, stderr_to_stdout: true) do
+      {output, 0} ->
+        {:ok, IO.iodata_to_binary(output)}
+
+      {output, status} ->
+        {:error, {:command_failed, IO.iodata_to_binary(output), status}}
+    end
+  rescue
+    error ->
+      {:error, Exception.message(error)}
+  end
+
+  defp default_command_runner(command, args, opts) do
+    System.cmd(command, args, opts)
+  end
 
   defp ensure_jira_tracker_configured do
     if Config.settings!().tracker.kind == "jira" do
@@ -344,6 +656,92 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:missing_github_delivery_workspace) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` requires a current workspace."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_github_delivery_commit_message) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` requires a non-empty `commitMessage` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:missing_github_delivery_pr_title) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` requires a non-empty `prTitle` string."
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_github_delivery_arguments) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` expects an object with `commitMessage`, `prTitle`, optional `prBody`, and optional string `paths` entries."
+      }
+    }
+  end
+
+  defp tool_error_payload(:github_delivery_no_changes) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` found no workspace changes to commit after staging."
+      }
+    }
+  end
+
+  defp tool_error_payload(:github_delivery_missing_branch) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` could not determine the current git branch."
+      }
+    }
+  end
+
+  defp tool_error_payload({:missing_executable, command}) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` requires `#{command}` to be available in Symphony's host environment."
+      }
+    }
+  end
+
+  defp tool_error_payload({:github_delivery_closed_pr, url}) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` found a closed or merged pull request for the current branch.",
+        "url" => url
+      }
+    }
+  end
+
+  defp tool_error_payload({stage, reason})
+       when stage in [
+              :github_delivery_stage_failed,
+              :github_delivery_status_failed,
+              :github_delivery_commit_failed,
+              :github_delivery_rev_parse_failed,
+              :github_delivery_branch_failed,
+              :github_delivery_push_failed,
+              :github_delivery_pr_view_failed,
+              :github_delivery_pr_edit_failed,
+              :github_delivery_pr_create_failed,
+              :github_delivery_origin_failed
+            ] do
+    %{
+      "error" => %{
+        "message" => github_delivery_stage_message(stage),
+        "reason" => format_github_delivery_reason(reason)
+      }
+    }
+  end
+
   defp tool_error_payload({:jira_comment_failed, reason}) do
     %{
       "error" => %{
@@ -396,6 +794,43 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   end
+
+  defp github_delivery_stage_message(:github_delivery_stage_failed),
+    do: "GitHub delivery failed while staging changes."
+
+  defp github_delivery_stage_message(:github_delivery_status_failed),
+    do: "GitHub delivery failed while checking git status."
+
+  defp github_delivery_stage_message(:github_delivery_commit_failed),
+    do: "GitHub delivery failed while creating the git commit."
+
+  defp github_delivery_stage_message(:github_delivery_rev_parse_failed),
+    do: "GitHub delivery failed while reading the new commit SHA."
+
+  defp github_delivery_stage_message(:github_delivery_branch_failed),
+    do: "GitHub delivery failed while reading the current branch."
+
+  defp github_delivery_stage_message(:github_delivery_push_failed),
+    do: "GitHub delivery failed while pushing the current branch."
+
+  defp github_delivery_stage_message(:github_delivery_pr_view_failed),
+    do: "GitHub delivery failed while checking the current pull request."
+
+  defp github_delivery_stage_message(:github_delivery_pr_edit_failed),
+    do: "GitHub delivery failed while updating the pull request."
+
+  defp github_delivery_stage_message(:github_delivery_pr_create_failed),
+    do: "GitHub delivery failed while creating the pull request."
+
+  defp github_delivery_stage_message(:github_delivery_origin_failed),
+    do: "GitHub delivery failed while reading the origin remote URL."
+
+  defp format_github_delivery_reason({:command_failed, output, status}) do
+    "command exited with status #{status}: #{String.trim(output)}"
+  end
+
+  defp format_github_delivery_reason(reason) when is_binary(reason), do: reason
+  defp format_github_delivery_reason(reason), do: inspect(reason)
 
   defp supported_tool_names do
     Enum.map(tool_specs(), & &1["name"])

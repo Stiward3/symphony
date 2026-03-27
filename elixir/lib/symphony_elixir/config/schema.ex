@@ -54,6 +54,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_key, :string)
       field(:jql, :string)
       field(:assignee, :string)
+      field(:dispatch_states, {:array, :string})
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -73,6 +74,7 @@ defmodule SymphonyElixir.Config.Schema do
           :project_key,
           :jql,
           :assignee,
+          :dispatch_states,
           :active_states,
           :terminal_states
         ],
@@ -481,12 +483,17 @@ defmodule SymphonyElixir.Config.Schema do
   defp resolve_base_url_value(nil), do: nil
 
   defp resolve_base_url_value(value) when is_binary(value) do
-    value
-    |> resolve_env_value(nil)
-    |> String.trim()
-    |> case do
-      "" -> nil
-      normalized -> String.trim_trailing(normalized, "/")
+    case resolve_env_value(value, nil) do
+      nil ->
+        nil
+
+      resolved ->
+        resolved
+        |> String.trim()
+        |> case do
+          "" -> nil
+          normalized -> String.trim_trailing(normalized, "/")
+        end
     end
   end
 

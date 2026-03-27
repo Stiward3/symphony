@@ -82,12 +82,23 @@ escript ./bin/symphony --i-understand-that-this-will-be-running-without-the-usua
 
 Useful notes for WSL:
 
+- **If Codex asks you to sign in, complete that login from WSL before starting Symphony so the
+  app-server session can execute normally.**
 - Export tracker credentials in the same WSL shell before launching Symphony, for example
   `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, and `JIRA_PROJECT_KEY` for Jira workflows.
+- If you want agents to push branches and create GitHub PRs, configure GitHub access in the same
+  WSL environment before launching Symphony:
+  - ensure the workspace repo is cloned from GitHub and has a working `origin` remote
+  - install the GitHub CLI (`gh`) in WSL
+  - authenticate `gh` with an account that can push branches and open PRs in the target repo
+  - make sure plain `git push` also works in WSL, either through SSH keys or Git credential
+    manager/HTTPS auth
+  - run `gh auth setup-git` if you want `git push` over HTTPS to reuse the GitHub CLI credentials
+  - verify access with `gh auth status`, `git remote -v`, and a dry-run `git push --dry-run origin HEAD`
+  - Symphony does not keep a separate GitHub credential store; it uses whatever `git` and `gh`
+    access is already available in the same WSL shell where you launch Symphony
 - If `server.port` is set in `WORKFLOW.md`, the observability dashboard is available at
   `http://127.0.0.1:<port>/` from Windows while Symphony keeps running in WSL.
-- If Codex asks you to sign in, complete that login from WSL before starting Symphony so the
-  app-server session can execute normally.
 
 Example Jira environment setup in WSL:
 
@@ -97,6 +108,44 @@ export JIRA_EMAIL="your-email@company.com"
 export JIRA_API_TOKEN="your-jira-api-token"
 export JIRA_PROJECT_KEY="ABC"
 ```
+
+Example GitHub access setup in WSL for branch push + PR creation:
+
+```bash
+# Install GitHub CLI if needed.
+sudo apt-get update
+sudo apt-get install -y gh
+
+# Authenticate gh for GitHub API and PR operations.
+gh auth login
+gh auth setup-git
+gh auth status
+
+# Confirm the repo points at GitHub and push auth works.
+git remote -v
+git push --dry-run origin HEAD
+```
+
+If your repo uses SSH remotes, make sure the WSL user has an SSH key that GitHub trusts:
+
+```bash
+ssh -T git@github.com
+```
+
+Optional environment variables for ticket-scoped repo creation:
+
+```bash
+export GITHUB_REPO_OWNER="your-org-or-user"
+export GITHUB_REPO_PREFIX="symphony"
+export GITHUB_REPO_VISIBILITY="private"
+```
+
+If your workflow asks Symphony to create a new GitHub repo for a ticket, it should:
+
+- derive the repo name from the ticket identifier and title
+- create the repo under `GITHUB_REPO_OWNER`
+- use `GITHUB_REPO_PREFIX` when provided
+- default to `private` visibility unless `GITHUB_REPO_VISIBILITY` says otherwise
 
 ## Configuration
 

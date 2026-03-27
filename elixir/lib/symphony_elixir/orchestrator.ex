@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Orchestrator do
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+    log_startup_tool_resolution()
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -68,6 +69,31 @@ defmodule SymphonyElixir.Orchestrator do
     state = schedule_tick(state, 0)
 
     {:ok, state}
+  end
+
+  defp log_startup_tool_resolution do
+    path = System.get_env("PATH") || ""
+
+    tool_paths =
+      ["gh", "make", "mix", "python3"]
+      |> Enum.map(fn tool -> {tool, System.find_executable(tool)} end)
+      |> Enum.map(fn
+        {tool, nil} -> "#{tool}=missing"
+        {tool, executable} -> "#{tool}=#{executable}"
+      end)
+      |> Enum.join(" ")
+
+    Logger.info(
+      "Startup tool preflight path=#{inspect(truncate_for_log(path, 2_048))} #{tool_paths}"
+    )
+  end
+
+  defp truncate_for_log(value, max_bytes) when is_binary(value) and is_integer(max_bytes) and max_bytes > 0 do
+    if byte_size(value) <= max_bytes do
+      value
+    else
+      binary_part(value, 0, max_bytes) <> "... (truncated)"
+    end
   end
 
   @impl true
@@ -317,7 +343,7 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
-    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+    should_dispatch_issue?(issue, state, dispatch_state_set(), terminal_state_set())
   end
 
   @doc false
@@ -524,13 +550,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminate_task(_pid), do: :ok
 
   defp choose_issues(issues, state) do
-    active_states = active_state_set()
+    dispatch_states = dispatch_state_set()
     terminal_states = terminal_state_set()
 
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+      if should_dispatch_issue?(issue, state_acc, dispatch_states, terminal_states) do
         dispatch_issue(state_acc, issue)
       else
         state_acc
@@ -659,6 +685,21 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp active_state_set do
     Config.settings!().tracker.active_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
+  defp dispatch_state_set do
+    dispatch_states = Config.settings!().tracker.dispatch_states
+
+    states =
+      case dispatch_states do
+        states when is_list(states) and states != [] -> states
+        _ -> Config.settings!().tracker.active_states
+      end
+
+    states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -859,14 +900,11 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.update_issue_state(issue_id, state_name) do
       :ok ->
         body =
-          [
-            "## Symphony blocked run",
-            "",
+          fallback_workpad_comment_body(
+            state_name,
             "Symphony moved this issue to `#{state_name}` before starting Codex because the issue description is empty.",
-            "",
-            "Reason: `#{error}`"
-          ]
-          |> Enum.join("\n")
+            error
+          )
 
         case Tracker.create_comment(issue_id, body) do
           :ok ->
@@ -1072,6 +1110,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp error_stop_comment_body(state_name, error) do
+    fallback_workpad_comment_body(
+      state_name,
+      "Symphony moved this issue to `#{state_name}` after a runtime failure.",
+      error
+    )
+  end
+
+  defp fallback_workpad_comment_body(state_name, summary, error)
+       when is_binary(state_name) and is_binary(summary) do
     details =
       case error do
         value when is_binary(value) and value != "" -> value
@@ -1079,10 +1126,15 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     [
-      "## Symphony blocked run",
+      "## Codex Workpad",
       "",
-      "Symphony moved this issue to `#{state_name}` after a runtime failure.",
+      "### Notes",
+      "- #{summary}",
       "",
+      "### Validation",
+      "- [ ] Blocked: `#{details}`",
+      "",
+      "### Confusions",
       "Reason: `#{details}`"
     ]
     |> Enum.join("\n")

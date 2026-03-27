@@ -38,10 +38,25 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                  "type" => "object"
                },
                "name" => "jira_issue_update"
+             },
+             %{
+               "description" => github_description,
+               "inputSchema" => %{
+                 "properties" => %{
+                   "commitMessage" => _,
+                   "paths" => _,
+                   "prBody" => _,
+                   "prTitle" => _
+                 },
+                 "required" => ["commitMessage", "prTitle"],
+                 "type" => "object"
+               },
+               "name" => "github_delivery"
              }
            ] = DynamicTool.tool_specs()
 
     assert description =~ "Jira"
+    assert github_description =~ "GitHub"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -172,6 +187,91 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "error" => %{
                "message" => "Jira state transition failed.",
                "reason" => ":state_not_found"
+             }
+           }
+  end
+
+  test "github_delivery commits, pushes, and creates a pull request from the host workspace" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+    test_pid = self()
+    workspace = Path.join(System.tmp_dir!(), "github-delivery-test-#{System.unique_integer([:positive, :monotonic])}")
+    File.mkdir_p!(workspace)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat(jira): add fixture\n\nSummary:\n- add fixture\n",
+          "prTitle" => "Add Jira fixture",
+          "prBody" => "## Summary\n- add fixture",
+          "paths" => ["elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json"]
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["add", "--", "elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 abc1234] Add Jira fixture\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"abc1234def5678\n", 0}
+            {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"git", ["push", "-u", "origin", "HEAD"]} -> {"remote ok\n", 0}
+            {"gh", ["pr", "view", "--json", "state,url"]} -> {~s({"state":"OPEN","url":"https://github.com/Stiward3/symphony/pull/219"}), 0}
+            {"gh", ["pr", "edit", "--title", "Add Jira fixture", "--body", "## Summary\n- add fixture"]} -> {"updated\n", 0}
+            {"git", ["remote", "get-url", "origin"]} -> {"https://github.com/Stiward3/symphony.git\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:command_runner_called, "git", ["add", "--", "elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "git", ["push", "-u", "origin", "HEAD"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "gh", ["pr", "edit", "--title", "Add Jira fixture", "--body", "## Summary\n- add fixture"], [cd: ^workspace, stderr_to_stdout: true]}
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "commitSha" => "abc1234def5678",
+             "pr" => %{
+               "action" => "updated",
+               "url" => "https://github.com/Stiward3/symphony/pull/219"
+             },
+             "repoUrl" => "https://github.com/Stiward3/symphony.git"
+           }
+  end
+
+  test "github_delivery reports missing host executables clearly" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: test",
+          "prTitle" => "Test PR"
+        },
+        workspace: "/tmp/workspace",
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> nil
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("command runner should not be called when gh is missing")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "`github_delivery` requires `gh` to be available in Symphony's host environment."
              }
            }
   end

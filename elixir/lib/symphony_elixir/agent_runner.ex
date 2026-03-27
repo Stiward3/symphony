@@ -227,6 +227,7 @@ defmodule SymphonyElixir.AgentRunner do
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - If the tracker is Jira, use `jira_issue_update` for issue comments and state transitions.
+    - If GitHub delivery is required, prefer the host-side `github_delivery` dynamic tool over sandbox shell commands.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
   end

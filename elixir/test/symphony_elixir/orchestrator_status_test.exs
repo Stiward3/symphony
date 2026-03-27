@@ -1083,7 +1083,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
     assert_receive {:memory_tracker_comment, ^issue_id, body}
-    assert body =~ "## Symphony blocked run"
+    assert body =~ "## Codex Workpad"
+    assert body =~ "### Notes"
+    assert body =~ "### Validation"
     assert body =~ "moved this issue to `Blocked`"
     assert body =~ "stalled for "
 

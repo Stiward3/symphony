@@ -151,7 +151,8 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
+    assert Map.get(hooks, "after_create") =~
+             "git clone --depth 1 \"${SOURCE_REPO_URL:-https://github.com/Stiward3/symphony.git}\" ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
@@ -747,7 +748,9 @@ defmodule SymphonyElixir.CoreTest do
 
     assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}
     assert_receive {:memory_tracker_comment, ^issue_id, body}
-    assert body =~ "## Symphony blocked run"
+    assert body =~ "## Codex Workpad"
+    assert body =~ "### Notes"
+    assert body =~ "### Validation"
     assert body =~ "moved this issue to `Blocked`"
     assert body =~ "agent exited: :boom"
 
