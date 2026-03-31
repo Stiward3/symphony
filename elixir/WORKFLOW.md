@@ -16,6 +16,9 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/.symphony-workspaces
+github:
+  create_delivery_branch: true
+  delivery_branch_template: "codex/{{ issue.identifier }}"
 hooks:
   after_create: |
     git clone --depth 1 "${SOURCE_REPO_URL:-https://github.com/Stiward3/symphony.git}" .
@@ -78,6 +81,7 @@ GitHub delivery:
 - If `GITHUB_REPO_OWNER` is not configured and a writable GitHub `origin` remote already exists, commit the finished work, push a branch, and create or update a PR before moving Jira to `Code Review`.
 - Derive new repo names from the Jira identifier plus a short slug from the title. If `GITHUB_REPO_PREFIX` is set, prefix the repo name with it.
 - Use `GITHUB_REPO_VISIBILITY` when set; otherwise default new repos to `private`.
+- When `github.create_delivery_branch` is enabled, `github_delivery` will create or reset the configured delivery branch before commit and push.
 - When creating a dedicated repo, pass `repoOwner`, `repoName`, and optional `repoVisibility` to `github_delivery` so delivery goes to that new repository instead of the source clone remote.
 - Prefer the host-side `github_delivery` dynamic tool for commit, push, and PR creation or update whenever it is available.
 - Use GitHub CLI commands (`gh repo create`, `gh pr create`, `gh pr edit`, `gh auth status`) directly only when the task truly needs something the dynamic tool does not cover.

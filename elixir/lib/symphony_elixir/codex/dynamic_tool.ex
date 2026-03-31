@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Client, Tracker}
+  alias SymphonyElixir.{Config, Linear.Client, Tracker, Workflow}
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -69,6 +69,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       "prBody" => %{
         "type" => ["string", "null"],
         "description" => "Optional pull request body markdown."
+      },
+      "branchName" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional delivery branch name to create or reset before commit and push."
       },
       "repoOwner" => %{
         "type" => ["string", "null"],
@@ -177,12 +181,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     command_runner = Keyword.get(opts, :command_runner, &default_command_runner/3)
     executable_finder = Keyword.get(opts, :executable_finder, &System.find_executable/1)
     workspace = Keyword.get(opts, :workspace)
+    issue = Keyword.get(opts, :issue)
 
     with {:ok, workspace} <- normalize_workspace(workspace),
-         {:ok, commit_message, pr_title, pr_body, paths, repo_owner, repo_name, repo_visibility} <-
+         {:ok, commit_message, pr_title, pr_body, branch_name, paths, repo_owner, repo_name, repo_visibility} <-
            normalize_github_delivery_arguments(arguments),
          {:ok, _git_path} <- ensure_executable_available("git", executable_finder),
          {:ok, _gh_path} <- ensure_executable_available("gh", executable_finder),
+         {:ok, current_branch_name} <- current_branch(workspace, command_runner),
+         {:ok, delivery_branch_name} <- resolve_delivery_branch(branch_name, issue, current_branch_name),
+         :ok <- ensure_delivery_branch(workspace, current_branch_name, delivery_branch_name, command_runner),
          :ok <- stage_github_delivery_changes(workspace, paths, command_runner),
          {:ok, changed?} <- workspace_has_changes?(workspace, command_runner),
          :ok <- ensure_github_delivery_changes(changed?),
@@ -284,6 +292,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         Map.get(arguments, "pr_body") ||
         Map.get(arguments, :pr_body)
 
+    branch_name =
+      Map.get(arguments, "branchName") ||
+        Map.get(arguments, :branchName) ||
+        Map.get(arguments, "branch_name") ||
+        Map.get(arguments, :branch_name)
+
     repo_owner =
       Map.get(arguments, "repoOwner") ||
         Map.get(arguments, :repoOwner) ||
@@ -312,12 +326,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
            normalize_required_string(pr_title, :missing_github_delivery_pr_title),
          {:ok, normalized_pr_body} <-
            normalize_optional_string(pr_body, :invalid_github_delivery_arguments),
+         {:ok, normalized_branch_name} <- normalize_optional_branch_name(branch_name),
          {:ok, normalized_paths} <- normalize_optional_path_list(paths),
          {:ok, normalized_repo_owner, normalized_repo_name} <-
            normalize_optional_repo_target(repo_owner, repo_name),
          {:ok, normalized_repo_visibility} <-
            normalize_repo_visibility(repo_visibility) do
-      {:ok, normalized_commit_message, normalized_pr_title, normalized_pr_body, normalized_paths,
+      {:ok, normalized_commit_message, normalized_pr_title, normalized_pr_body,
+       normalized_branch_name, normalized_paths,
        normalized_repo_owner, normalized_repo_name, normalized_repo_visibility}
     end
   end
@@ -393,6 +409,25 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_optional_path_list(_paths), do: {:error, :invalid_github_delivery_arguments}
+
+  defp normalize_optional_branch_name(nil), do: {:ok, nil}
+
+  defp normalize_optional_branch_name(branch_name) when is_binary(branch_name) do
+    normalized = String.trim(branch_name)
+
+    cond do
+      normalized == "" ->
+        {:ok, nil}
+
+      String.contains?(normalized, ["\n", "\r", <<0>>, " "]) ->
+        {:error, :invalid_github_delivery_arguments}
+
+      true ->
+        {:ok, normalized}
+    end
+  end
+
+  defp normalize_optional_branch_name(_branch_name), do: {:error, :invalid_github_delivery_arguments}
 
   defp normalize_optional_repo_target(nil, nil), do: {:ok, nil, nil}
 
@@ -509,6 +544,109 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
       {:error, reason} ->
         {:error, {:github_delivery_branch_failed, reason}}
+    end
+  end
+
+  defp resolve_delivery_branch(branch_name, _issue, _current_branch) when is_binary(branch_name) do
+    {:ok, branch_name}
+  end
+
+  defp resolve_delivery_branch(nil, issue, current_branch) when is_binary(current_branch) do
+    case configured_delivery_branch_template() do
+      {:ok, nil} ->
+        {:ok, current_branch}
+
+      {:ok, template} ->
+        render_delivery_branch_template(template, issue, current_branch)
+    end
+  end
+
+  defp resolve_delivery_branch(_branch_name, _issue, current_branch), do: {:ok, current_branch}
+
+  defp configured_delivery_branch_template do
+    case Workflow.current() do
+      {:ok, %{config: %{"github" => github}}} when is_map(github) ->
+        create_branch? =
+          case Map.get(github, "create_delivery_branch") do
+            true -> true
+            "true" -> true
+            _ -> false
+          end
+
+        if create_branch? do
+          template =
+            github
+            |> Map.get("delivery_branch_template")
+            |> case do
+              value when is_binary(value) ->
+                case String.trim(value) do
+                  "" -> "codex/{{ issue.identifier }}"
+                  trimmed -> trimmed
+                end
+
+              _ ->
+                "codex/{{ issue.identifier }}"
+            end
+
+          {:ok, template}
+        else
+          {:ok, nil}
+        end
+
+      _ ->
+        {:ok, nil}
+    end
+  end
+
+  defp render_delivery_branch_template(template, issue, current_branch)
+       when is_binary(template) and is_binary(current_branch) do
+    issue_payload =
+      case issue do
+        %{__struct__: _} = struct_issue -> struct_issue |> Map.from_struct() |> stringify_issue_keys()
+        map when is_map(map) -> stringify_issue_keys(map)
+        _ -> %{}
+      end
+
+    case Solid.parse(template) do
+      {:ok, parsed_template, _warnings} ->
+        case Solid.render(parsed_template, %{"issue" => issue_payload, "current_branch" => current_branch},
+               strict_variables: true,
+               strict_filters: true
+             ) do
+          {:ok, rendered, _context} ->
+            rendered
+            |> IO.iodata_to_binary()
+            |> String.trim()
+            |> normalize_rendered_delivery_branch()
+
+          {:error, error} ->
+            {:error, {:github_delivery_branch_template_failed, Exception.message(error)}}
+        end
+
+      {:error, error} ->
+        {:error, {:github_delivery_branch_template_failed, Exception.message(error)}}
+    end
+  end
+
+  defp stringify_issue_keys(issue) when is_map(issue) do
+    Map.new(issue, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp normalize_rendered_delivery_branch(""), do: {:error, :github_delivery_missing_branch}
+
+  defp normalize_rendered_delivery_branch(branch_name) when is_binary(branch_name) do
+    normalize_optional_branch_name(branch_name)
+  end
+
+  defp ensure_delivery_branch(_workspace, current_branch, target_branch, _command_runner)
+       when current_branch == target_branch,
+       do: :ok
+
+  defp ensure_delivery_branch(workspace, _current_branch, target_branch, command_runner)
+       when is_binary(target_branch) do
+    case run_command(command_runner, "git", ["checkout", "-B", target_branch], workspace) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_branch_checkout_failed, reason}}
     end
   end
 
@@ -897,7 +1035,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:invalid_github_delivery_arguments) do
     %{
       "error" => %{
-        "message" => "`github_delivery` expects an object with `commitMessage`, `prTitle`, optional `prBody`, and optional string `paths` entries."
+        "message" => "`github_delivery` expects an object with `commitMessage`, `prTitle`, optional `prBody`, optional `branchName`, and optional string `paths` entries."
       }
     }
   end
@@ -942,6 +1080,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               :github_delivery_commit_failed,
               :github_delivery_rev_parse_failed,
               :github_delivery_branch_failed,
+              :github_delivery_branch_checkout_failed,
+              :github_delivery_branch_template_failed,
               :github_delivery_push_failed,
               :github_delivery_pr_view_failed,
               :github_delivery_pr_edit_failed,
@@ -1026,6 +1166,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp github_delivery_stage_message(:github_delivery_branch_failed),
     do: "GitHub delivery failed while reading the current branch."
+
+  defp github_delivery_stage_message(:github_delivery_branch_checkout_failed),
+    do: "GitHub delivery failed while creating or switching to the delivery branch."
+
+  defp github_delivery_stage_message(:github_delivery_branch_template_failed),
+    do: "GitHub delivery failed while rendering the configured delivery branch name."
 
   defp github_delivery_stage_message(:github_delivery_push_failed),
     do: "GitHub delivery failed while pushing the current branch."

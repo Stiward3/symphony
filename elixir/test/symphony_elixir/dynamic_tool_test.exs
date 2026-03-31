@@ -43,6 +43,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "description" => github_description,
                "inputSchema" => %{
                  "properties" => %{
+                   "branchName" => _,
                    "commitMessage" => _,
                    "paths" => _,
                    "prBody" => _,
@@ -352,6 +353,82 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "url" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test/pull/1"
              },
              "repoUrl" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"
+           }
+  end
+
+  test "github_delivery creates a configured delivery branch before committing" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_create_delivery_branch: true,
+      github_delivery_branch_template: "codex/{{ issue.identifier }}"
+    )
+
+    test_pid = self()
+    workspace = Path.join(System.tmp_dir!(), "github-delivery-branch-#{System.unique_integer([:positive, :monotonic])}")
+    File.mkdir_p!(workspace)
+
+    issue = %SymphonyElixir.Linear.Issue{
+      id: "issue-branch-1",
+      identifier: "RDSP-219",
+      title: "Symphony Build test",
+      state: "In Progress"
+    }
+
+    branch_state = :erlang.make_ref()
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: branch test",
+          "prTitle" => "Branch test"
+        },
+        issue: issue,
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["branch", "--show-current"]} ->
+              case Process.get(branch_state, :before_checkout) do
+                :after_checkout -> {"codex/RDSP-219\n", 0}
+                _ -> {"main\n", 0}
+              end
+
+            {"git", ["checkout", "-B", "codex/RDSP-219"]} ->
+              Process.put(branch_state, :after_checkout)
+              {"Switched\n", 0}
+
+            {"git", ["add", "-A"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 abc1234] Branch test\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"abc1234def5678\n", 0}
+            {"git", ["push", "-u", "origin", "HEAD"]} -> {"remote ok\n", 0}
+            {"gh", ["pr", "view", "--json", "state,url"]} -> {~s({"state":"OPEN","url":"https://github.com/Stiward3/symphony/pull/219"}), 0}
+            {"gh", ["pr", "edit", "--title", "Branch test"]} -> {"updated\n", 0}
+            {"git", ["remote", "get-url", "origin"]} -> {"https://github.com/Stiward3/symphony.git\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:command_runner_called, "git", ["checkout", "-B", "codex/RDSP-219"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/Stiward3/symphony/tree/codex/RDSP-219",
+             "commitSha" => "abc1234def5678",
+             "pr" => %{
+               "action" => "updated",
+               "url" => "https://github.com/Stiward3/symphony/pull/219"
+             },
+             "repoUrl" => "https://github.com/Stiward3/symphony.git"
            }
   end
 
