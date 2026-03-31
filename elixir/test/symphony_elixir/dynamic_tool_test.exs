@@ -46,7 +46,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                    "commitMessage" => _,
                    "paths" => _,
                    "prBody" => _,
-                   "prTitle" => _
+                   "prTitle" => _,
+                   "repoName" => _,
+                   "repoOwner" => _,
+                   "repoVisibility" => _
                  },
                  "required" => ["commitMessage", "prTitle"],
                  "type" => "object"
@@ -238,6 +241,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(response["output"]) == %{
              "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/Stiward3/symphony/tree/codex/RDSP-219",
              "commitSha" => "abc1234def5678",
              "pr" => %{
                "action" => "updated",
@@ -273,6 +277,81 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              "error" => %{
                "message" => "`github_delivery` requires `gh` to be available in Symphony's host environment."
              }
+           }
+  end
+
+  test "github_delivery can create and use a dedicated delivery repo" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+    test_pid = self()
+    workspace = Path.join(System.tmp_dir!(), "github-delivery-dedicated-#{System.unique_integer([:positive, :monotonic])}")
+    File.mkdir_p!(workspace)
+    Process.put(:dedicated_repo_pr_view_count, 0)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: create dedicated repo",
+          "prTitle" => "Create dedicated repo",
+          "repoOwner" => "sandbox-owner",
+          "repoName" => "rdsp-219-symphony-build-test",
+          "repoVisibility" => "private"
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["add", "-A"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 def4567] Create dedicated repo\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"def4567abc9999\n", 0}
+            {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/rdsp-219-symphony-build-test", "--json", "nameWithOwner,url"]} ->
+              {"not found\n", 1}
+            {"gh", ["repo", "create", "sandbox-owner/rdsp-219-symphony-build-test", "--private", "--confirm"]} ->
+              {"created\n", 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"]} ->
+              {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/rdsp-219-symphony-build-test", "pr", "view", "--json", "state,url"]} ->
+              case Process.get(:dedicated_repo_pr_view_count, 0) do
+                0 ->
+                  Process.put(:dedicated_repo_pr_view_count, 1)
+                  {"not found\n", 1}
+
+                _ ->
+                  {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/rdsp-219-symphony-build-test/pull/1"}), 0}
+              end
+
+            {"gh", ["-R", "sandbox-owner/rdsp-219-symphony-build-test", "pr", "create", "--head", "codex/RDSP-219", "--title", "Create dedicated repo"]} ->
+              {"created pr\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:command_runner_called, "gh", ["repo", "create", "sandbox-owner/rdsp-219-symphony-build-test", "--private", "--confirm"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "git", ["push", "-u", "delivery", "HEAD"], [cd: ^workspace, stderr_to_stdout: true]}
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test/tree/codex/RDSP-219",
+             "commitSha" => "def4567abc9999",
+             "pr" => %{
+               "action" => "created",
+               "url" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test/pull/1"
+             },
+             "repoUrl" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"
            }
   end
 

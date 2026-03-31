@@ -74,10 +74,11 @@ Rules:
 
 GitHub delivery:
 - Use the repository's existing Git history when available.
-- If a writable GitHub `origin` remote already exists, commit the finished work, push a branch, and create or update a PR before moving Jira to `Code Review`.
-- If no writable GitHub repo exists for this ticket and `GITHUB_REPO_OWNER` is configured, create a new GitHub repo for the deliverable, push the code there, and create the initial PR or default branch delivery as appropriate.
+- If `GITHUB_REPO_OWNER` is configured, prefer creating or reusing a dedicated GitHub repo for this ticket and deliver there instead of opening a PR inside the source clone remote.
+- If `GITHUB_REPO_OWNER` is not configured and a writable GitHub `origin` remote already exists, commit the finished work, push a branch, and create or update a PR before moving Jira to `Code Review`.
 - Derive new repo names from the Jira identifier plus a short slug from the title. If `GITHUB_REPO_PREFIX` is set, prefix the repo name with it.
 - Use `GITHUB_REPO_VISIBILITY` when set; otherwise default new repos to `private`.
+- When creating a dedicated repo, pass `repoOwner`, `repoName`, and optional `repoVisibility` to `github_delivery` so delivery goes to that new repository instead of the source clone remote.
 - Prefer the host-side `github_delivery` dynamic tool for commit, push, and PR creation or update whenever it is available.
 - Use GitHub CLI commands (`gh repo create`, `gh pr create`, `gh pr edit`, `gh auth status`) directly only when the task truly needs something the dynamic tool does not cover.
 - This Codex sandbox does not reliably inherit your interactive shell `PATH`, so shell-based GitHub delivery is not the default path here.
@@ -95,7 +96,8 @@ Jira workflow:
 Jira tool usage:
 - Use `jira_issue_update` to refresh the single `## Codex Workpad` comment.
 - Use `jira_issue_update` to move the issue to the correct state.
-- Use `github_delivery` for required host-side commit, push, and PR delivery when the repository already has a writable GitHub remote.
+- Use `github_delivery` for required host-side commit, push, and PR delivery.
+- When `GITHUB_REPO_OWNER` is configured, call `github_delivery` with dedicated repo arguments by default so each ticket lands in its own repository.
 - When the deliverable is complete, validated as far as this environment allows, and the workspace changes are ready, complete GitHub delivery first, then move the issue forward and stop.
 
 Execution flow:
@@ -137,7 +139,7 @@ Workpad shape:
 
 ### Notes
 - brief progress notes
-- include branch name, repo URL, and PR URL when GitHub delivery succeeds
+- include branch URL, repo URL, and PR URL when GitHub delivery succeeds
 
 ### Confusions
 - include only for unresolved questions, state-mapping mismatches, or blockers
@@ -164,6 +166,6 @@ Workpad writing guidance:
 - Write for a human teammate reading Jira quickly.
 - In `Validation`, prefer lines like `Passed: python3 parsed ...` or `Not run: mix test ... because mix is unavailable in this environment`.
 - In `Notes`, summarize what was found or changed, not raw thought process.
-- In `Notes`, include concise GitHub delivery evidence such as `Branch: ...`, `Repo: ...`, and `PR: ...`.
+- In `Notes`, include concise GitHub delivery evidence such as `Branch URL: ...`, `Repo: ...`, and `PR: ...`.
 - Only add `Confusions` when something remains unresolved after the work is complete enough to hand off or block.
 - If a wrapped `bash -lc 'source ~/.profile ...'` command still fails, record that exact wrapped command and its stderr in `Validation` or `Confusions`.

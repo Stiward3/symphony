@@ -144,10 +144,12 @@ defmodule SymphonyElixir.CoreTest do
 
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
-    assert Map.get(tracker, "kind") == "linear"
-    assert is_binary(Map.get(tracker, "project_slug"))
+    assert Map.get(tracker, "kind") == "jira"
+    assert is_binary(Map.get(tracker, "project_key"))
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
+    assert Map.get(tracker, "dispatch_states") == ["Ready"]
+    assert Map.get(tracker, "active_states") == ["Ready", "In Progress"]
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
@@ -160,6 +162,8 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
+    assert prompt =~ "`Code Review`: stop coding."
+    assert prompt =~ "Branch URL: ..."
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
@@ -1135,19 +1139,18 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt =~ "You are working on a Linear ticket `MT-616`"
+    assert prompt =~ "You are working on Jira issue `MT-616`"
     assert prompt =~ "Issue context:"
-    assert prompt =~ "Identifier: MT-616"
-    assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
+    assert prompt =~ "- Identifier: MT-616"
+    assert prompt =~ "- Title: Use rich templates for WORKFLOW.md"
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "Keep one persistent Jira comment headed `## Codex Workpad`"
+    assert prompt =~ "Use `github_delivery` for required host-side commit, push, and PR delivery."
+    assert prompt =~ "`Code Review`: stop coding."
+    assert prompt =~ "Branch URL: ..."
     assert prompt =~ "Continuation context:"
-    assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Retry/continuation attempt #2."
   end
 
   test "prompt builder adds continuation guidance for retries" do

@@ -70,6 +70,18 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "type" => ["string", "null"],
         "description" => "Optional pull request body markdown."
       },
+      "repoOwner" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional GitHub owner for a dedicated delivery repo."
+      },
+      "repoName" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional GitHub repository name for a dedicated delivery repo."
+      },
+      "repoVisibility" => %{
+        "type" => ["string", "null"],
+        "description" => "Optional visibility for a dedicated delivery repo. Allowed values: private, public, internal."
+      },
       "paths" => %{
         "type" => ["array", "null"],
         "description" => "Optional list of repo-relative paths to stage. When omitted, all workspace changes are staged.",
@@ -167,7 +179,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     workspace = Keyword.get(opts, :workspace)
 
     with {:ok, workspace} <- normalize_workspace(workspace),
-         {:ok, commit_message, pr_title, pr_body, paths} <-
+         {:ok, commit_message, pr_title, pr_body, paths, repo_owner, repo_name, repo_visibility} <-
            normalize_github_delivery_arguments(arguments),
          {:ok, _git_path} <- ensure_executable_available("git", executable_finder),
          {:ok, _gh_path} <- ensure_executable_available("gh", executable_finder),
@@ -176,14 +188,30 @@ defmodule SymphonyElixir.Codex.DynamicTool do
          :ok <- ensure_github_delivery_changes(changed?),
          {:ok, commit_sha} <- create_github_delivery_commit(workspace, commit_message, command_runner),
          {:ok, branch} <- current_branch(workspace, command_runner),
-         :ok <- push_current_branch(workspace, command_runner),
-         {:ok, pr_result} <- ensure_pull_request(workspace, branch, pr_title, pr_body, command_runner),
-         {:ok, repo_url} <- origin_url(workspace, command_runner) do
+         {:ok, delivery_target} <-
+           resolve_delivery_target(
+             workspace,
+             repo_owner,
+             repo_name,
+             repo_visibility,
+             command_runner
+           ),
+         :ok <- push_current_branch(workspace, delivery_target.remote, command_runner),
+         {:ok, pr_result} <-
+           ensure_pull_request(
+             workspace,
+             branch,
+             pr_title,
+             pr_body,
+             delivery_target.repo_selector,
+             command_runner
+           ) do
       %{
         "branch" => branch,
+        "branchUrl" => branch_url(delivery_target.repo_url, branch),
         "commitSha" => commit_sha,
         "pr" => pr_result,
-        "repoUrl" => repo_url
+        "repoUrl" => delivery_target.repo_url
       }
       |> success_response()
     else
@@ -256,6 +284,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         Map.get(arguments, "pr_body") ||
         Map.get(arguments, :pr_body)
 
+    repo_owner =
+      Map.get(arguments, "repoOwner") ||
+        Map.get(arguments, :repoOwner) ||
+        Map.get(arguments, "repo_owner") ||
+        Map.get(arguments, :repo_owner)
+
+    repo_name =
+      Map.get(arguments, "repoName") ||
+        Map.get(arguments, :repoName) ||
+        Map.get(arguments, "repo_name") ||
+        Map.get(arguments, :repo_name)
+
+    repo_visibility =
+      Map.get(arguments, "repoVisibility") ||
+        Map.get(arguments, :repoVisibility) ||
+        Map.get(arguments, "repo_visibility") ||
+        Map.get(arguments, :repo_visibility)
+
     paths =
       Map.get(arguments, "paths") ||
         Map.get(arguments, :paths)
@@ -266,8 +312,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
            normalize_required_string(pr_title, :missing_github_delivery_pr_title),
          {:ok, normalized_pr_body} <-
            normalize_optional_string(pr_body, :invalid_github_delivery_arguments),
-         {:ok, normalized_paths} <- normalize_optional_path_list(paths) do
-      {:ok, normalized_commit_message, normalized_pr_title, normalized_pr_body, normalized_paths}
+         {:ok, normalized_paths} <- normalize_optional_path_list(paths),
+         {:ok, normalized_repo_owner, normalized_repo_name} <-
+           normalize_optional_repo_target(repo_owner, repo_name),
+         {:ok, normalized_repo_visibility} <-
+           normalize_repo_visibility(repo_visibility) do
+      {:ok, normalized_commit_message, normalized_pr_title, normalized_pr_body, normalized_paths,
+       normalized_repo_owner, normalized_repo_name, normalized_repo_visibility}
     end
   end
 
@@ -342,6 +393,35 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_optional_path_list(_paths), do: {:error, :invalid_github_delivery_arguments}
+
+  defp normalize_optional_repo_target(nil, nil), do: {:ok, nil, nil}
+
+  defp normalize_optional_repo_target(repo_owner, repo_name) do
+    with {:ok, normalized_repo_owner} <-
+           normalize_required_string(repo_owner, :invalid_github_delivery_arguments),
+         {:ok, normalized_repo_name} <-
+           normalize_required_string(repo_name, :invalid_github_delivery_arguments) do
+      {:ok, normalized_repo_owner, normalized_repo_name}
+    else
+      {:error, _reason} -> {:error, :invalid_github_delivery_arguments}
+    end
+  end
+
+  defp normalize_repo_visibility(nil) do
+    case System.get_env("GITHUB_REPO_VISIBILITY") do
+      value when is_binary(value) -> normalize_repo_visibility(value)
+      _ -> {:ok, "private"}
+    end
+  end
+
+  defp normalize_repo_visibility(value) when is_binary(value) do
+    case String.downcase(String.trim(value)) do
+      visibility when visibility in ["private", "public", "internal"] -> {:ok, visibility}
+      _ -> {:error, :invalid_github_delivery_arguments}
+    end
+  end
+
+  defp normalize_repo_visibility(_value), do: {:error, :invalid_github_delivery_arguments}
 
   defp ensure_jira_issue_update_action(nil, nil), do: {:error, :missing_jira_issue_update_action}
   defp ensure_jira_issue_update_action(_comment, _state), do: :ok
@@ -432,37 +512,57 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp push_current_branch(workspace, command_runner) do
-    case run_command(command_runner, "git", ["push", "-u", "origin", "HEAD"], workspace) do
+  defp resolve_delivery_target(workspace, nil, nil, _repo_visibility, command_runner) do
+    with {:ok, repo_url} <- origin_url(workspace, command_runner) do
+      {:ok, %{remote: "origin", repo_selector: nil, repo_url: repo_url}}
+    end
+  end
+
+  defp resolve_delivery_target(workspace, repo_owner, repo_name, repo_visibility, command_runner)
+       when is_binary(repo_owner) and is_binary(repo_name) and is_binary(repo_visibility) do
+    with {:ok, repo_info} <-
+           ensure_dedicated_repo(workspace, repo_owner, repo_name, repo_visibility, command_runner),
+         :ok <- configure_delivery_remote(workspace, repo_info, command_runner) do
+      {:ok,
+       %{
+         remote: "delivery",
+         repo_selector: repo_info.repo_selector,
+         repo_url: repo_info.repo_url
+       }}
+    end
+  end
+
+  defp push_current_branch(workspace, remote_name, command_runner) do
+    case run_command(command_runner, "git", ["push", "-u", remote_name, "HEAD"], workspace) do
       {:ok, _output} -> :ok
       {:error, reason} -> {:error, {:github_delivery_push_failed, reason}}
     end
   end
 
-  defp ensure_pull_request(workspace, branch, pr_title, pr_body, command_runner) do
-    case view_pull_request(workspace, command_runner) do
+  defp ensure_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner) do
+    case view_pull_request(workspace, repo_selector, command_runner) do
       {:ok, %{"state" => state} = payload} when state in ["CLOSED", "MERGED"] ->
         {:error, {:github_delivery_closed_pr, Map.get(payload, "url")}}
 
       {:ok, %{"url" => url}} ->
-        with :ok <- update_pull_request(workspace, pr_title, pr_body, command_runner) do
+        with :ok <- update_pull_request(workspace, pr_title, pr_body, repo_selector, command_runner) do
           {:ok, %{"action" => "updated", "url" => url}}
         end
 
       {:error, {:command_failed, _message, 1}} ->
-        create_pull_request(workspace, branch, pr_title, pr_body, command_runner)
+        create_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner)
 
       {:error, reason} ->
         {:error, {:github_delivery_pr_view_failed, reason}}
     end
   end
 
-  defp view_pull_request(workspace, command_runner) do
+  defp view_pull_request(workspace, repo_selector, command_runner) do
     with {:ok, output} <-
            run_command(
              command_runner,
-             "gh",
-             ["pr", "view", "--json", "state,url"],
+              "gh",
+             github_repo_selector_args(repo_selector) ++ ["pr", "view", "--json", "state,url"],
              workspace
            ) do
       case Jason.decode(output) do
@@ -472,9 +572,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp update_pull_request(workspace, pr_title, pr_body, command_runner) do
+  defp update_pull_request(workspace, pr_title, pr_body, repo_selector, command_runner) do
     args =
-      ["pr", "edit", "--title", pr_title] ++
+      github_repo_selector_args(repo_selector) ++
+        ["pr", "edit", "--title", pr_title] ++
         maybe_pr_body_args(pr_body)
 
     case run_command(command_runner, "gh", args, workspace) do
@@ -483,13 +584,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp create_pull_request(workspace, branch, pr_title, pr_body, command_runner) do
+  defp create_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner) do
     args =
-      ["pr", "create", "--head", branch, "--title", pr_title] ++
+      github_repo_selector_args(repo_selector) ++
+        ["pr", "create", "--head", branch, "--title", pr_title] ++
         maybe_pr_body_args(pr_body)
 
     with {:ok, _output} <- run_command(command_runner, "gh", args, workspace),
-         {:ok, %{"url" => url}} <- view_pull_request(workspace, command_runner) do
+         {:ok, %{"url" => url}} <- view_pull_request(workspace, repo_selector, command_runner) do
       {:ok, %{"action" => "created", "url" => url}}
     else
       {:error, reason} -> {:error, {:github_delivery_pr_create_failed, reason}}
@@ -501,6 +603,118 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp maybe_pr_body_args(pr_body) when is_binary(pr_body) do
     ["--body", pr_body]
   end
+
+  defp ensure_dedicated_repo(workspace, repo_owner, repo_name, repo_visibility, command_runner) do
+    repo_selector = "#{repo_owner}/#{repo_name}"
+    repo_url = "https://github.com/#{repo_selector}.git"
+
+    case run_command(
+           command_runner,
+           "gh",
+           ["repo", "view", repo_selector, "--json", "nameWithOwner,url"],
+           workspace
+         ) do
+      {:ok, _output} ->
+        {:ok, %{repo_selector: repo_selector, repo_url: repo_url}}
+
+      {:error, {:command_failed, _output, 1}} ->
+        create_dedicated_repo(workspace, repo_selector, repo_url, repo_visibility, command_runner)
+
+      {:error, reason} ->
+        {:error, {:github_delivery_repo_view_failed, reason}}
+    end
+  end
+
+  defp create_dedicated_repo(workspace, repo_selector, repo_url, repo_visibility, command_runner) do
+    case run_command(
+           command_runner,
+           "gh",
+           ["repo", "create", repo_selector, "--#{repo_visibility}", "--confirm"],
+           workspace
+         ) do
+      {:ok, _output} ->
+        {:ok, %{repo_selector: repo_selector, repo_url: repo_url}}
+
+      {:error, reason} ->
+        {:error, {:github_delivery_repo_create_failed, reason}}
+    end
+  end
+
+  defp configure_delivery_remote(workspace, %{repo_url: repo_url}, command_runner)
+       when is_binary(repo_url) do
+    case git_remote_exists?(workspace, "delivery", command_runner) do
+      {:ok, true} ->
+        case run_command(command_runner, "git", ["remote", "set-url", "delivery", repo_url], workspace) do
+          {:ok, _output} -> :ok
+          {:error, reason} -> {:error, {:github_delivery_remote_failed, reason}}
+        end
+
+      {:ok, false} ->
+        case run_command(command_runner, "git", ["remote", "add", "delivery", repo_url], workspace) do
+          {:ok, _output} -> :ok
+          {:error, reason} -> {:error, {:github_delivery_remote_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:github_delivery_remote_failed, reason}}
+    end
+  end
+
+  defp git_remote_exists?(workspace, remote_name, command_runner) do
+    case run_command(command_runner, "git", ["remote"], workspace) do
+      {:ok, output} ->
+        remotes =
+          output
+          |> String.split("\n", trim: true)
+          |> MapSet.new()
+
+        {:ok, MapSet.member?(remotes, remote_name)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp github_repo_selector_args(nil), do: []
+  defp github_repo_selector_args(repo_selector), do: ["-R", repo_selector]
+
+  defp branch_url(repo_url, branch) when is_binary(repo_url) and is_binary(branch) do
+    case repo_web_url(repo_url) do
+      nil -> nil
+      web_url -> web_url <> "/tree/" <> branch
+    end
+  end
+
+  defp branch_url(_repo_url, _branch), do: nil
+
+  defp repo_web_url(repo_url) when is_binary(repo_url) do
+    normalized =
+      repo_url
+      |> String.trim()
+      |> String.trim_trailing(".git")
+
+    cond do
+      normalized == "" ->
+        nil
+
+      String.starts_with?(normalized, "https://github.com/") ->
+        normalized
+
+      String.starts_with?(normalized, "http://github.com/") ->
+        normalized
+
+      String.starts_with?(normalized, "git@github.com:") ->
+        "https://github.com/" <> String.replace_prefix(normalized, "git@github.com:", "")
+
+      String.starts_with?(normalized, "ssh://git@github.com/") ->
+        "https://github.com/" <> String.replace_prefix(normalized, "ssh://git@github.com/", "")
+
+      true ->
+        nil
+    end
+  end
+
+  defp repo_web_url(_repo_url), do: nil
 
   defp origin_url(workspace, command_runner) do
     case run_command(command_runner, "git", ["remote", "get-url", "origin"], workspace) do
@@ -732,7 +946,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               :github_delivery_pr_view_failed,
               :github_delivery_pr_edit_failed,
               :github_delivery_pr_create_failed,
-              :github_delivery_origin_failed
+              :github_delivery_origin_failed,
+              :github_delivery_repo_view_failed,
+              :github_delivery_repo_create_failed,
+              :github_delivery_remote_failed
             ] do
     %{
       "error" => %{
@@ -824,6 +1041,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp github_delivery_stage_message(:github_delivery_origin_failed),
     do: "GitHub delivery failed while reading the origin remote URL."
+
+  defp github_delivery_stage_message(:github_delivery_repo_view_failed),
+    do: "GitHub delivery failed while checking the dedicated repository."
+
+  defp github_delivery_stage_message(:github_delivery_repo_create_failed),
+    do: "GitHub delivery failed while creating the dedicated repository."
+
+  defp github_delivery_stage_message(:github_delivery_remote_failed),
+    do: "GitHub delivery failed while configuring the dedicated git remote."
 
   defp format_github_delivery_reason({:command_failed, output, status}) do
     "command exited with status #{status}: #{String.trim(output)}"
