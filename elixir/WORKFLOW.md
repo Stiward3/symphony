@@ -18,7 +18,12 @@ workspace:
   root: ~/.symphony-workspaces
 github:
   create_delivery_branch: true
+  branch_repo: "$GITHUB_BRANCH_REPO"
+  pr_base_branch: "$GITHUB_PR_BASE_BRANCH"
   delivery_branch_template: "codex/{{ issue.identifier }}"
+  artifact_only_delivery: true
+  require_artifact_paths: true
+  artifact_only_strip_prefix: "elixir/"
 hooks:
   after_create: |
     git clone --depth 1 "${SOURCE_REPO_URL:-https://github.com/Stiward3/symphony.git}" .
@@ -81,7 +86,13 @@ GitHub delivery:
 - If `GITHUB_REPO_OWNER` is not configured and a writable GitHub `origin` remote already exists, commit the finished work, push a branch, and create or update a PR before moving Jira to `Code Review`.
 - Derive new repo names from the Jira identifier plus a short slug from the title. If `GITHUB_REPO_PREFIX` is set, prefix the repo name with it.
 - Use `GITHUB_REPO_VISIBILITY` when set; otherwise default new repos to `private`.
+- If `GITHUB_BRANCH_REPO` is set, `github_delivery` will create the branch and PR in that existing `owner/repository` instead of the source clone remote.
+- Set `GITHUB_BRANCH_REPO` to the exact `owner/repository` where delivery branches must be created when your team wants all ticket branches to land in one existing GitHub repository.
+- If `GITHUB_PR_BASE_BRANCH` is set, `github_delivery` will use that branch as the PR base when the target repository default branch is unsuitable for delivery.
 - When `github.create_delivery_branch` is enabled, `github_delivery` will create or reset the configured delivery branch before commit and push.
+- When `github.artifact_only_delivery` is enabled for dedicated repos or `GITHUB_BRANCH_REPO` delivery, `github_delivery` will export only the selected task files instead of mirroring the full Symphony workspace.
+- When `github.require_artifact_paths` is enabled for dedicated repos or `GITHUB_BRANCH_REPO` delivery, `github_delivery` requires explicit `paths` so only the intended task files are exported.
+- When `github.artifact_only_strip_prefix` is set, exported files drop that leading path prefix in the delivery repository.
 - When creating a dedicated repo, pass `repoOwner`, `repoName`, and optional `repoVisibility` to `github_delivery` so delivery goes to that new repository instead of the source clone remote.
 - Prefer the host-side `github_delivery` dynamic tool for commit, push, and PR creation or update whenever it is available.
 - Use GitHub CLI commands (`gh repo create`, `gh pr create`, `gh pr edit`, `gh auth status`) directly only when the task truly needs something the dynamic tool does not cover.
@@ -102,6 +113,7 @@ Jira tool usage:
 - Use `jira_issue_update` to move the issue to the correct state.
 - Use `github_delivery` for required host-side commit, push, and PR delivery.
 - When `GITHUB_REPO_OWNER` is configured, call `github_delivery` with dedicated repo arguments by default so each ticket lands in its own repository.
+- When `GITHUB_BRANCH_REPO` is configured, treat it as the required existing repository where delivery branches must be created.
 - When the deliverable is complete, validated as far as this environment allows, and the workspace changes are ready, complete GitHub delivery first, then move the issue forward and stop.
 
 Execution flow:
@@ -117,6 +129,7 @@ Execution flow:
 
 Command guidance:
 - Prefer the host-side `github_delivery` dynamic tool over sandbox `git` + `gh` commands for normal Jira ticket delivery.
+- When calling `github_delivery` for artifact-style delivery, always pass the smallest task-specific `paths` list instead of omitting it.
 - When running `mix`, `make`, `gh`, or other tools that may come from profile-loaded paths, do not call them bare.
 - Use wrappers like `bash -lc 'source ~/.profile >/dev/null 2>&1 || true; cd elixir && mise exec -- mix test test/symphony_elixir/jira_mock_fixture_test.exs'`.
 - Use wrappers like `bash -lc 'source ~/.profile >/dev/null 2>&1 || true; gh auth status'`.

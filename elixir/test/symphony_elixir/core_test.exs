@@ -151,6 +151,14 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(tracker, "dispatch_states") == ["Ready"]
     assert Map.get(tracker, "active_states") == ["Ready", "In Progress"]
 
+    github = Map.get(config, "github", %{})
+    assert is_map(github)
+    assert Map.get(github, "branch_repo") == "$GITHUB_BRANCH_REPO"
+    assert Map.get(github, "pr_base_branch") == "$GITHUB_PR_BASE_BRANCH"
+    assert Map.get(github, "artifact_only_delivery") == true
+    assert Map.get(github, "require_artifact_paths") == true
+    assert Map.get(github, "artifact_only_strip_prefix") == "elixir/"
+
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
     assert Map.get(hooks, "after_create") =~
@@ -164,6 +172,8 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() == prompt
     assert prompt =~ "`Code Review`: stop coding."
     assert prompt =~ "Branch URL: ..."
+    assert prompt =~ "Set `GITHUB_BRANCH_REPO` to the exact `owner/repository`"
+    assert prompt =~ "If `GITHUB_PR_BASE_BRANCH` is set"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

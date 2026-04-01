@@ -71,18 +71,24 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, value), do: System.put_env(key, value)
 
   def stop_default_http_server do
-    case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
-           {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
-           _child -> false
-         end) do
-      {SymphonyElixir.HttpServer, pid, _type, _modules} when is_pid(pid) ->
-        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.HttpServer)
+    case Process.whereis(SymphonyElixir.Supervisor) do
+      pid when is_pid(pid) ->
+        case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
+               {SymphonyElixir.HttpServer, _child_pid, _type, _modules} -> true
+               _child -> false
+             end) do
+          {SymphonyElixir.HttpServer, child_pid, _type, _modules} when is_pid(child_pid) ->
+            :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.HttpServer)
 
-        if Process.alive?(pid) do
-          Process.exit(pid, :normal)
+            if Process.alive?(child_pid) do
+              Process.exit(child_pid, :normal)
+            end
+
+            :ok
+
+          _ ->
+            :ok
         end
-
-        :ok
 
       _ ->
         :ok
@@ -107,7 +113,12 @@ defmodule SymphonyElixir.TestSupport do
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           github_create_delivery_branch: nil,
+          github_branch_repo: nil,
+          github_pr_base_branch: nil,
           github_delivery_branch_template: nil,
+          github_artifact_only_delivery: nil,
+          github_require_artifact_paths: nil,
+          github_artifact_only_strip_prefix: nil,
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
@@ -151,7 +162,12 @@ defmodule SymphonyElixir.TestSupport do
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     github_create_delivery_branch = Keyword.get(config, :github_create_delivery_branch)
+    github_branch_repo = Keyword.get(config, :github_branch_repo)
+    github_pr_base_branch = Keyword.get(config, :github_pr_base_branch)
     github_delivery_branch_template = Keyword.get(config, :github_delivery_branch_template)
+    github_artifact_only_delivery = Keyword.get(config, :github_artifact_only_delivery)
+    github_require_artifact_paths = Keyword.get(config, :github_require_artifact_paths)
+    github_artifact_only_strip_prefix = Keyword.get(config, :github_artifact_only_strip_prefix)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
@@ -197,7 +213,15 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
-        github_yaml(github_create_delivery_branch, github_delivery_branch_template),
+        github_yaml(
+          github_create_delivery_branch,
+          github_branch_repo,
+          github_pr_base_branch,
+          github_delivery_branch_template,
+          github_artifact_only_delivery,
+          github_require_artifact_paths,
+          github_artifact_only_strip_prefix
+        ),
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
@@ -246,13 +270,26 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp github_yaml(nil, nil), do: nil
+  defp github_yaml(nil, nil, nil, nil, nil, nil, nil), do: nil
 
-  defp github_yaml(create_delivery_branch, delivery_branch_template) do
+  defp github_yaml(
+         create_delivery_branch,
+         branch_repo,
+         pr_base_branch,
+         delivery_branch_template,
+         artifact_only_delivery,
+         require_artifact_paths,
+         artifact_only_strip_prefix
+       ) do
     [
       "github:",
       github_entry("create_delivery_branch", create_delivery_branch),
-      github_entry("delivery_branch_template", delivery_branch_template)
+      github_entry("branch_repo", branch_repo),
+      github_entry("pr_base_branch", pr_base_branch),
+      github_entry("delivery_branch_template", delivery_branch_template),
+      github_entry("artifact_only_delivery", artifact_only_delivery),
+      github_entry("require_artifact_paths", require_artifact_paths),
+      github_entry("artifact_only_strip_prefix", artifact_only_strip_prefix)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")

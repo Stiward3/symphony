@@ -183,45 +183,74 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     workspace = Keyword.get(opts, :workspace)
     issue = Keyword.get(opts, :issue)
 
-    with {:ok, workspace} <- normalize_workspace(workspace),
+    with {:ok, source_workspace} <- normalize_workspace(workspace),
          {:ok, commit_message, pr_title, pr_body, branch_name, paths, repo_owner, repo_name, repo_visibility} <-
            normalize_github_delivery_arguments(arguments),
          {:ok, _git_path} <- ensure_executable_available("git", executable_finder),
          {:ok, _gh_path} <- ensure_executable_available("gh", executable_finder),
-         {:ok, current_branch_name} <- current_branch(workspace, command_runner),
+         {:ok, configured_branch_repo} <- configured_branch_repo(),
+         :ok <- ensure_artifact_delivery_paths(paths, repo_owner, repo_name, configured_branch_repo),
+         {:ok, current_branch_name} <- current_branch(source_workspace, command_runner),
          {:ok, delivery_branch_name} <- resolve_delivery_branch(branch_name, issue, current_branch_name),
-         :ok <- ensure_delivery_branch(workspace, current_branch_name, delivery_branch_name, command_runner),
-         :ok <- stage_github_delivery_changes(workspace, paths, command_runner),
-         {:ok, changed?} <- workspace_has_changes?(workspace, command_runner),
-         :ok <- ensure_github_delivery_changes(changed?),
-         {:ok, commit_sha} <- create_github_delivery_commit(workspace, commit_message, command_runner),
-         {:ok, branch} <- current_branch(workspace, command_runner),
-         {:ok, delivery_target} <-
-           resolve_delivery_target(
-             workspace,
-             repo_owner,
-             repo_name,
-             repo_visibility,
-             command_runner
-           ),
-         :ok <- push_current_branch(workspace, delivery_target.remote, command_runner),
-         {:ok, pr_result} <-
-           ensure_pull_request(
-             workspace,
-             branch,
-             pr_title,
-             pr_body,
-             delivery_target.repo_selector,
-             command_runner
-           ) do
-      %{
-        "branch" => branch,
-        "branchUrl" => branch_url(delivery_target.repo_url, branch),
-        "commitSha" => commit_sha,
-        "pr" => pr_result,
-        "repoUrl" => delivery_target.repo_url
-      }
-      |> success_response()
+         {:ok, delivery_workspace, stage_paths, cleanup} <-
+           prepare_delivery_workspace(
+              source_workspace,
+              paths,
+              repo_owner,
+              repo_name,
+              repo_visibility,
+              configured_branch_repo,
+              command_runner
+            ) do
+      try do
+        with :ok <- ensure_delivery_branch(delivery_workspace, current_branch_name, delivery_branch_name, command_runner),
+             :ok <- stage_github_delivery_changes(delivery_workspace, stage_paths, command_runner),
+             {:ok, changed?} <- workspace_has_changes?(delivery_workspace, command_runner),
+             :ok <- ensure_github_delivery_changes(changed?),
+             {:ok, commit_sha} <- create_github_delivery_commit(delivery_workspace, commit_message, command_runner),
+             {:ok, branch} <- current_branch(delivery_workspace, command_runner),
+             {:ok, delivery_target} <-
+               resolve_delivery_target(
+                 delivery_workspace,
+                 repo_owner,
+                 repo_name,
+                 repo_visibility,
+                 configured_branch_repo,
+                 command_runner
+               ),
+             {:ok, pr_base_branch} <-
+               resolve_pull_request_base_branch(
+                 delivery_workspace,
+                 delivery_target,
+                 branch,
+                 command_runner
+               ),
+             :ok <- push_current_branch(delivery_workspace, delivery_target.remote, command_runner),
+             {:ok, pr_result} <-
+               ensure_pull_request(
+                 delivery_workspace,
+                 branch,
+                 pr_title,
+                 pr_body,
+                 delivery_target.repo_selector,
+                 pr_base_branch,
+                 command_runner
+               ) do
+          %{
+            "branch" => branch,
+            "branchUrl" => branch_url(delivery_target.repo_url, branch),
+            "commitSha" => commit_sha,
+            "pr" => pr_result,
+            "repoUrl" => delivery_target.repo_url
+          }
+          |> success_response()
+        else
+          {:error, reason} ->
+            failure_response(tool_error_payload(reason))
+        end
+      after
+        cleanup.()
+      end
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
@@ -608,20 +637,27 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       end
 
     case Solid.parse(template) do
-      {:ok, parsed_template, _warnings} ->
-        case Solid.render(parsed_template, %{"issue" => issue_payload, "current_branch" => current_branch},
-               strict_variables: true,
-               strict_filters: true
-             ) do
-          {:ok, rendered, _context} ->
-            rendered
-            |> IO.iodata_to_binary()
-            |> String.trim()
-            |> normalize_rendered_delivery_branch()
+      {:ok, parsed_template} ->
+        render_parsed_delivery_branch_template(parsed_template, issue_payload, current_branch)
 
-          {:error, error} ->
-            {:error, {:github_delivery_branch_template_failed, Exception.message(error)}}
-        end
+      {:ok, parsed_template, _warnings} ->
+        render_parsed_delivery_branch_template(parsed_template, issue_payload, current_branch)
+
+      {:error, error} ->
+        {:error, {:github_delivery_branch_template_failed, Exception.message(error)}}
+    end
+  end
+
+  defp render_parsed_delivery_branch_template(parsed_template, issue_payload, current_branch) do
+    case Solid.render(parsed_template, %{"issue" => issue_payload, "current_branch" => current_branch},
+           strict_variables: true,
+           strict_filters: true
+         ) do
+      {:ok, rendered, _context} ->
+        rendered
+        |> IO.iodata_to_binary()
+        |> String.trim()
+        |> normalize_rendered_delivery_branch()
 
       {:error, error} ->
         {:error, {:github_delivery_branch_template_failed, Exception.message(error)}}
@@ -650,23 +686,459 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp resolve_delivery_target(workspace, nil, nil, _repo_visibility, command_runner) do
-    with {:ok, repo_url} <- origin_url(workspace, command_runner) do
-      {:ok, %{remote: "origin", repo_selector: nil, repo_url: repo_url}}
+  defp prepare_delivery_workspace(
+         workspace,
+         paths,
+         repo_owner,
+         repo_name,
+         repo_visibility,
+         configured_branch_repo,
+         command_runner
+       )
+       when is_binary(workspace) do
+    if artifact_only_delivery_enabled?(repo_owner, repo_name, configured_branch_repo) do
+      with {:ok, export_paths} <- resolve_export_paths(workspace, paths, command_runner),
+           {:ok, temp_workspace} <-
+             create_artifact_only_workspace(
+               workspace,
+               export_paths,
+               repo_owner,
+               repo_name,
+               repo_visibility,
+               configured_branch_repo,
+               command_runner
+             ) do
+        {:ok, temp_workspace, nil, fn -> File.rm_rf(temp_workspace) end}
+      end
+    else
+      {:ok, workspace, paths, fn -> :ok end}
     end
   end
 
-  defp resolve_delivery_target(workspace, repo_owner, repo_name, repo_visibility, command_runner)
+  defp artifact_only_delivery_enabled?(repo_owner, repo_name, configured_branch_repo)
+       when (is_binary(repo_owner) and is_binary(repo_name)) or is_binary(configured_branch_repo) do
+    github_settings()
+    |> Map.get("artifact_only_delivery")
+    |> truthy?()
+  end
+
+  defp artifact_only_delivery_enabled?(_repo_owner, _repo_name, _configured_branch_repo), do: false
+
+  defp artifact_delivery_requires_paths?(repo_owner, repo_name, configured_branch_repo)
+       when (is_binary(repo_owner) and is_binary(repo_name)) or is_binary(configured_branch_repo) do
+    github_settings()
+    |> Map.get("require_artifact_paths")
+    |> truthy?()
+  end
+
+  defp artifact_delivery_requires_paths?(_repo_owner, _repo_name, _configured_branch_repo), do: false
+
+  defp ensure_artifact_delivery_paths(paths, repo_owner, repo_name, configured_branch_repo)
+       when is_nil(paths) and
+              ((is_binary(repo_owner) and is_binary(repo_name)) or is_binary(configured_branch_repo)) do
+    if artifact_only_delivery_enabled?(repo_owner, repo_name, configured_branch_repo) and
+         artifact_delivery_requires_paths?(repo_owner, repo_name, configured_branch_repo) do
+      {:error, :github_delivery_missing_paths_for_artifact_export}
+    else
+      :ok
+    end
+  end
+
+  defp ensure_artifact_delivery_paths(_paths, _repo_owner, _repo_name, _configured_branch_repo), do: :ok
+
+  defp github_settings do
+    case Workflow.current() do
+      {:ok, %{config: %{"github" => github}}} when is_map(github) -> github
+      _ -> %{}
+    end
+  end
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?("TRUE"), do: true
+  defp truthy?(_value), do: false
+
+  defp resolve_export_paths(_workspace, paths, _command_runner) when is_list(paths), do: {:ok, paths}
+
+  defp resolve_export_paths(workspace, nil, command_runner) do
+    case changed_paths(workspace, command_runner) do
+      {:ok, []} -> {:error, :github_delivery_no_changes}
+      {:ok, paths} -> {:ok, paths}
+      {:error, reason} -> {:error, {:github_delivery_status_failed, reason}}
+    end
+  end
+
+  defp changed_paths(workspace, command_runner) do
+    case run_command(command_runner, "git", ["status", "--porcelain"], workspace) do
+      {:ok, output} -> {:ok, parse_changed_paths(output)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_changed_paths(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim_trailing/1)
+    |> Enum.reduce([], fn line, acc ->
+      case String.length(line) do
+        length when length < 4 ->
+          acc
+
+        _ ->
+          path =
+            line
+            |> String.slice(3..-1//1)
+            |> normalize_changed_path()
+
+          if path in [nil, ""] do
+            acc
+          else
+            [path | acc]
+          end
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.uniq()
+  end
+
+  defp normalize_changed_path(path) when is_binary(path) do
+    case String.split(path, "->") do
+      [_left, right] -> String.trim(right)
+      _ -> String.trim(path)
+    end
+  end
+
+  defp create_artifact_only_workspace(
+         source_workspace,
+         export_paths,
+         repo_owner,
+         repo_name,
+         repo_visibility,
+         configured_branch_repo,
+         command_runner
+       )
+       when is_binary(source_workspace) and is_list(export_paths) do
+    temp_workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-artifact-delivery-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    try do
+      File.rm_rf!(temp_workspace)
+
+      with {:ok, delivery_target} <-
+             resolve_delivery_target(
+               source_workspace,
+               repo_owner,
+               repo_name,
+               repo_visibility,
+               configured_branch_repo,
+               command_runner
+             ),
+           :ok <- clone_artifact_base(temp_workspace, delivery_target, source_workspace, command_runner),
+           :ok <- copy_export_paths(source_workspace, temp_workspace, export_paths) do
+        {:ok, temp_workspace}
+      else
+        {:error, reason} ->
+          File.rm_rf(temp_workspace)
+          {:error, wrap_artifact_delivery_reason(reason)}
+      end
+    rescue
+      error in [File.Error] ->
+        File.rm_rf(temp_workspace)
+        {:error, {:github_delivery_artifact_export_failed, Exception.message(error)}}
+    end
+  end
+
+  defp wrap_artifact_delivery_reason({:command_failed, _output, _status} = reason),
+    do: {:github_delivery_artifact_init_failed, reason}
+
+  defp wrap_artifact_delivery_reason(reason), do: reason
+
+  defp clone_artifact_base(temp_workspace, %{repo_url: repo_url, base_branch: base_branch}, workspace, command_runner)
+       when is_binary(temp_workspace) and is_binary(repo_url) and is_binary(base_branch) do
+    case run_command(
+           command_runner,
+           "git",
+           ["clone", "--depth", "1", "--branch", base_branch, repo_url, temp_workspace],
+           workspace
+         ) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:error, {:github_delivery_artifact_clone_failed, reason}}
+    end
+  end
+
+  defp copy_export_paths(source_workspace, temp_workspace, export_paths) do
+    strip_prefix = artifact_only_strip_prefix()
+
+    Enum.reduce_while(export_paths, :ok, fn path, :ok ->
+      with {:ok, source_path, destination_path} <-
+             resolve_export_copy(source_workspace, temp_workspace, path, strip_prefix),
+           :ok <- File.mkdir_p(Path.dirname(destination_path)),
+           :ok <- File.cp(source_path, destination_path) do
+        {:cont, :ok}
+      else
+        {:error, reason} -> {:halt, {:error, {:github_delivery_artifact_export_failed, reason}}}
+      end
+    end)
+  end
+
+  defp artifact_only_strip_prefix do
+    github_settings()
+    |> Map.get("artifact_only_strip_prefix")
+    |> case do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp resolve_export_copy(source_workspace, temp_workspace, path, strip_prefix)
+       when is_binary(source_workspace) and is_binary(temp_workspace) and is_binary(path) do
+    source_path = Path.expand(path, source_workspace)
+
+    cond do
+      not String.starts_with?(source_path, source_workspace <> "/") and source_path != source_workspace ->
+        {:error, {:invalid_export_path, path}}
+
+      not File.regular?(source_path) ->
+        {:error, {:missing_export_file, path}}
+
+      true ->
+        exported_path =
+          case strip_prefix do
+            prefix when is_binary(prefix) ->
+              if String.starts_with?(path, prefix) do
+                String.replace_prefix(path, prefix, "")
+              else
+                path
+              end
+
+            _ ->
+              path
+          end
+
+        normalized_exported_path = String.trim_leading(exported_path, "/\\")
+
+        if normalized_exported_path == "" do
+          {:error, {:invalid_export_path, path}}
+        else
+          destination_path = Path.expand(normalized_exported_path, temp_workspace)
+
+          if String.starts_with?(destination_path, temp_workspace <> "/") or destination_path == temp_workspace do
+            {:ok, source_path, destination_path}
+          else
+            {:error, {:invalid_export_path, path}}
+          end
+        end
+    end
+  end
+
+  defp resolve_delivery_target(workspace, nil, nil, _repo_visibility, nil, command_runner) do
+    with {:ok, repo_url} <- origin_url(workspace, command_runner),
+         {:ok, base_branch} <- repo_default_branch(workspace, nil, command_runner) do
+      {:ok, %{remote: "origin", repo_selector: nil, repo_url: repo_url, base_branch: base_branch}}
+    end
+  end
+
+  defp resolve_delivery_target(
+         workspace,
+         nil,
+         nil,
+         _repo_visibility,
+         configured_branch_repo,
+         command_runner
+       )
+       when is_binary(configured_branch_repo) do
+    resolve_existing_delivery_repo(workspace, configured_branch_repo, command_runner)
+  end
+
+  defp resolve_delivery_target(
+         workspace,
+         repo_owner,
+         repo_name,
+         repo_visibility,
+         _configured_branch_repo,
+         command_runner
+       )
        when is_binary(repo_owner) and is_binary(repo_name) and is_binary(repo_visibility) do
     with {:ok, repo_info} <-
            ensure_dedicated_repo(workspace, repo_owner, repo_name, repo_visibility, command_runner),
-         :ok <- configure_delivery_remote(workspace, repo_info, command_runner) do
+         :ok <- configure_delivery_remote(workspace, repo_info, command_runner),
+         {:ok, base_branch} <- repo_default_branch(workspace, repo_info.repo_selector, command_runner) do
       {:ok,
        %{
          remote: "delivery",
          repo_selector: repo_info.repo_selector,
-         repo_url: repo_info.repo_url
+         repo_url: repo_info.repo_url,
+         base_branch: base_branch
        }}
+    end
+  end
+
+  defp configured_branch_repo do
+    github_settings()
+    |> Map.get("branch_repo")
+    |> normalize_branch_repo_value()
+  end
+
+  defp normalize_branch_repo_value(nil) do
+    case System.get_env("GITHUB_BRANCH_REPO") do
+      value when is_binary(value) -> normalize_branch_repo_value(value)
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp normalize_branch_repo_value(value) when is_binary(value) do
+    normalized = String.trim(value)
+
+    cond do
+      normalized == "" ->
+        {:ok, nil}
+
+      String.starts_with?(normalized, "$") ->
+        normalized
+        |> String.trim_leading("$")
+        |> String.trim_leading("{")
+        |> String.trim_trailing("}")
+        |> case do
+          "" -> {:error, :invalid_github_branch_repo}
+          env_name -> normalize_branch_repo_value(System.get_env(env_name))
+        end
+
+      true ->
+        case String.split(normalized, "/", parts: 2) do
+          [owner, repo] when owner != "" and repo != "" -> {:ok, "#{owner}/#{repo}"}
+          _ -> {:error, :invalid_github_branch_repo}
+        end
+    end
+  end
+
+  defp normalize_branch_repo_value(_value), do: {:error, :invalid_github_branch_repo}
+
+  defp resolve_existing_delivery_repo(workspace, repo_selector, command_runner)
+       when is_binary(repo_selector) do
+    repo_url = "https://github.com/#{repo_selector}.git"
+
+    case run_command(
+           command_runner,
+           "gh",
+           ["repo", "view", repo_selector, "--json", "nameWithOwner,url"],
+           workspace
+         ) do
+      {:ok, _output} ->
+        with :ok <- configure_delivery_remote(workspace, %{repo_url: repo_url}, command_runner),
+             {:ok, base_branch} <- repo_default_branch(workspace, repo_selector, command_runner) do
+          {:ok, %{
+            remote: "delivery",
+            repo_selector: repo_selector,
+            repo_url: repo_url,
+            base_branch: base_branch
+          }}
+        end
+
+      {:error, {:command_failed, _output, 1}} ->
+        {:error, :github_delivery_branch_repo_missing}
+
+      {:error, reason} ->
+        {:error, {:github_delivery_repo_view_failed, reason}}
+    end
+  end
+
+  defp resolve_pull_request_base_branch(
+         _workspace,
+         %{base_branch: base_branch},
+         branch,
+         _command_runner
+       )
+       when is_binary(base_branch) and is_binary(branch) and base_branch != branch do
+    {:ok, base_branch}
+  end
+
+  defp resolve_pull_request_base_branch(
+         workspace,
+         %{repo_url: repo_url},
+         branch,
+         command_runner
+       )
+       when is_binary(repo_url) and is_binary(branch) do
+    branch
+    |> candidate_pull_request_base_branches()
+    |> Enum.reduce_while({:error, {:github_delivery_pr_base_branch_missing, branch}}, fn candidate,
+                                                                                        _acc ->
+      case remote_branch_exists?(workspace, repo_url, candidate, command_runner) do
+        {:ok, true} -> {:halt, {:ok, candidate}}
+        {:ok, false} -> {:cont, {:error, {:github_delivery_pr_base_branch_missing, branch}}}
+        {:error, reason} -> {:halt, {:error, {:github_delivery_pr_base_failed, reason}}}
+      end
+    end)
+  end
+
+  defp candidate_pull_request_base_branches(branch) when is_binary(branch) do
+    [configured_pr_base_branch(), "main", "master"]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == "" or &1 == branch))
+    |> Enum.uniq()
+  end
+
+  defp configured_pr_base_branch do
+    github_settings()
+    |> Map.get("pr_base_branch")
+    |> normalize_pr_base_branch_value()
+    |> case do
+      {:ok, value} -> value
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp normalize_pr_base_branch_value(nil) do
+    case System.get_env("GITHUB_PR_BASE_BRANCH") do
+      value when is_binary(value) -> normalize_pr_base_branch_value(value)
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp normalize_pr_base_branch_value(value) when is_binary(value) do
+    normalized = String.trim(value)
+
+    cond do
+      normalized == "" ->
+        {:ok, nil}
+
+      String.starts_with?(normalized, "$") ->
+        normalized
+        |> String.trim_leading("$")
+        |> String.trim_leading("{")
+        |> String.trim_trailing("}")
+        |> case do
+          "" -> {:ok, nil}
+          env_name -> normalize_pr_base_branch_value(System.get_env(env_name))
+        end
+
+      true ->
+        normalize_optional_branch_name(normalized)
+    end
+  end
+
+  defp normalize_pr_base_branch_value(_value), do: {:ok, nil}
+
+  defp remote_branch_exists?(workspace, repo_url, branch_name, command_runner)
+       when is_binary(repo_url) and is_binary(branch_name) do
+    case run_command(
+           command_runner,
+           "git",
+           ["ls-remote", "--heads", repo_url, "refs/heads/#{branch_name}"],
+           workspace
+         ) do
+      {:ok, output} -> {:ok, String.trim(output) != ""}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -677,7 +1149,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp ensure_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner) do
+  defp ensure_pull_request(
+         workspace,
+         branch,
+         pr_title,
+         pr_body,
+         repo_selector,
+         base_branch,
+         command_runner
+       ) do
     case view_pull_request(workspace, repo_selector, command_runner) do
       {:ok, %{"state" => state} = payload} when state in ["CLOSED", "MERGED"] ->
         {:error, {:github_delivery_closed_pr, Map.get(payload, "url")}}
@@ -688,7 +1168,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         end
 
       {:error, {:command_failed, _message, 1}} ->
-        create_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner)
+        create_pull_request(workspace, branch, pr_title, pr_body, repo_selector, base_branch, command_runner)
 
       {:error, reason} ->
         {:error, {:github_delivery_pr_view_failed, reason}}
@@ -722,24 +1202,70 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp create_pull_request(workspace, branch, pr_title, pr_body, repo_selector, command_runner) do
+  defp create_pull_request(
+         workspace,
+         branch,
+         pr_title,
+         pr_body,
+         repo_selector,
+         base_branch,
+         command_runner
+       ) do
     args =
       github_repo_selector_args(repo_selector) ++
-        ["pr", "create", "--head", branch, "--title", pr_title] ++
+        ["pr", "create", "--head", branch, "--base", base_branch, "--title", pr_title] ++
         maybe_pr_body_args(pr_body)
 
-    with {:ok, _output} <- run_command(command_runner, "gh", args, workspace),
-         {:ok, %{"url" => url}} <- view_pull_request(workspace, repo_selector, command_runner) do
-      {:ok, %{"action" => "created", "url" => url}}
-    else
+    case run_command(command_runner, "gh", args, workspace) do
+      {:ok, output} ->
+        url =
+          case view_pull_request(workspace, repo_selector, command_runner) do
+            {:ok, %{"url" => viewed_url}} when is_binary(viewed_url) and viewed_url != "" ->
+              viewed_url
+
+            _ ->
+              extract_pull_request_url(output)
+          end
+
+        {:ok, %{"action" => "created", "url" => url}}
+
       {:error, reason} -> {:error, {:github_delivery_pr_create_failed, reason}}
     end
   end
+
+  defp extract_pull_request_url(output) when is_binary(output) do
+    case Regex.run(~r/https:\/\/github\.com\/\S+\/pull\/\d+/, output) do
+      [url | _rest] -> url
+      _ -> nil
+    end
+  end
+
+  defp extract_pull_request_url(_output), do: nil
 
   defp maybe_pr_body_args(nil), do: []
 
   defp maybe_pr_body_args(pr_body) when is_binary(pr_body) do
     ["--body", pr_body]
+  end
+
+  defp repo_default_branch(workspace, repo_selector, command_runner) do
+    args =
+      case repo_selector do
+        selector when is_binary(selector) -> ["repo", "view", selector, "--json", "defaultBranchRef"]
+        _ -> ["repo", "view", "--json", "defaultBranchRef"]
+      end
+
+    with {:ok, output} <- run_command(command_runner, "gh", args, workspace),
+         {:ok, payload} <- Jason.decode(output),
+         %{"defaultBranchRef" => %{"name" => branch_name}} when is_binary(branch_name) <- payload do
+      {:ok, branch_name}
+    else
+      {:error, reason} ->
+        {:error, {:github_delivery_default_branch_failed, reason}}
+
+      _ ->
+        {:error, :github_delivery_default_branch_missing}
+    end
   end
 
   defp ensure_dedicated_repo(workspace, repo_owner, repo_name, repo_visibility, command_runner) do
@@ -814,7 +1340,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp github_repo_selector_args(nil), do: []
-  defp github_repo_selector_args(repo_selector), do: ["-R", repo_selector]
+
+  defp github_repo_selector_args(repo_selector) when is_binary(repo_selector) do
+    case String.trim(repo_selector) do
+      "" -> []
+      normalized -> ["-R", normalized]
+    end
+  end
+
+  defp github_repo_selector_args(_repo_selector), do: []
 
   defp branch_url(repo_url, branch) when is_binary(repo_url) and is_binary(branch) do
     case repo_web_url(repo_url) do
@@ -1056,6 +1590,39 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload(:github_delivery_missing_paths_for_artifact_export) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` requires explicit `paths` when artifact-only delivery is enabled for a dedicated repository."
+      }
+    }
+  end
+
+  defp tool_error_payload({:github_delivery_artifact_export_failed, reason}) do
+    %{
+      "error" => %{
+        "message" => "GitHub delivery failed while exporting the selected artifact files.",
+        "reason" => inspect(reason)
+      }
+    }
+  end
+
+  defp tool_error_payload(:invalid_github_branch_repo) do
+    %{
+      "error" => %{
+        "message" => "`GITHUB_BRANCH_REPO` must be set to `owner/repository`."
+      }
+    }
+  end
+
+  defp tool_error_payload(:github_delivery_branch_repo_missing) do
+    %{
+      "error" => %{
+        "message" => "`github_delivery` could not find the repository configured by `GITHUB_BRANCH_REPO`."
+      }
+    }
+  end
+
   defp tool_error_payload({:missing_executable, command}) do
     %{
       "error" => %{
@@ -1073,6 +1640,16 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:github_delivery_pr_base_branch_missing, branch}) do
+    %{
+      "error" => %{
+        "message" =>
+          "`github_delivery` could not determine a pull request base branch different from the delivery branch.",
+        "branch" => branch
+      }
+    }
+  end
+
   defp tool_error_payload({stage, reason})
        when stage in [
               :github_delivery_stage_failed,
@@ -1082,6 +1659,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               :github_delivery_branch_failed,
               :github_delivery_branch_checkout_failed,
               :github_delivery_branch_template_failed,
+              :github_delivery_artifact_init_failed,
               :github_delivery_push_failed,
               :github_delivery_pr_view_failed,
               :github_delivery_pr_edit_failed,
@@ -1089,7 +1667,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
               :github_delivery_origin_failed,
               :github_delivery_repo_view_failed,
               :github_delivery_repo_create_failed,
-              :github_delivery_remote_failed
+              :github_delivery_remote_failed,
+              :github_delivery_pr_base_failed
             ] do
     %{
       "error" => %{
@@ -1173,6 +1752,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp github_delivery_stage_message(:github_delivery_branch_template_failed),
     do: "GitHub delivery failed while rendering the configured delivery branch name."
 
+  defp github_delivery_stage_message(:github_delivery_artifact_init_failed),
+    do: "GitHub delivery failed while preparing the dedicated artifact repository."
+
   defp github_delivery_stage_message(:github_delivery_push_failed),
     do: "GitHub delivery failed while pushing the current branch."
 
@@ -1196,6 +1778,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp github_delivery_stage_message(:github_delivery_remote_failed),
     do: "GitHub delivery failed while configuring the dedicated git remote."
+
+  defp github_delivery_stage_message(:github_delivery_pr_base_failed),
+    do: "GitHub delivery failed while resolving the pull request base branch."
 
   defp format_github_delivery_reason({:command_failed, output, status}) do
     "command exited with status #{status}: #{String.trim(output)}"

@@ -126,6 +126,19 @@ git remote -v
 git push --dry-run origin HEAD
 ```
 
+If you want Symphony to create delivery branches and PRs in an existing GitHub
+repository instead of the source clone remote, export these in the same WSL
+shell before starting Symphony:
+
+```bash
+export GITHUB_BRANCH_REPO="your-org-or-user/your-delivery-repo"
+export GITHUB_PR_BASE_BRANCH="main"
+```
+
+Use `GITHUB_PR_BASE_BRANCH` when the target repository default branch is not the
+branch you want Symphony to open PRs against. For demo repositories initialized
+with `master`, set `GITHUB_PR_BASE_BRANCH=master` before launch.
+
 If your repo uses SSH remotes, make sure the WSL user has an SSH key that GitHub trusts:
 
 ```bash

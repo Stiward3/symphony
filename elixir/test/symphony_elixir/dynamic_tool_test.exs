@@ -225,6 +225,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 abc1234] Add Jira fixture\n", 0}
             {"git", ["rev-parse", "HEAD"]} -> {"abc1234def5678\n", 0}
             {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"gh", ["repo", "view", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
             {"git", ["push", "-u", "origin", "HEAD"]} -> {"remote ok\n", 0}
             {"gh", ["pr", "view", "--json", "state,url"]} -> {~s({"state":"OPEN","url":"https://github.com/Stiward3/symphony/pull/219"}), 0}
             {"gh", ["pr", "edit", "--title", "Add Jira fixture", "--body", "## Summary\n- add fixture"]} -> {"updated\n", 0}
@@ -282,7 +284,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   test "github_delivery can create and use a dedicated delivery repo" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "jira")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_artifact_only_delivery: false
+    )
     test_pid = self()
     workspace = Path.join(System.tmp_dir!(), "github-delivery-dedicated-#{System.unique_integer([:positive, :monotonic])}")
     File.mkdir_p!(workspace)
@@ -317,6 +322,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
               {"not found\n", 1}
             {"gh", ["repo", "create", "sandbox-owner/rdsp-219-symphony-build-test", "--private", "--confirm"]} ->
               {"created\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/rdsp-219-symphony-build-test", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
             {"git", ["remote"]} -> {"origin\n", 0}
             {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"]} ->
               {"", 0}
@@ -331,7 +338,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                   {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/rdsp-219-symphony-build-test/pull/1"}), 0}
               end
 
-            {"gh", ["-R", "sandbox-owner/rdsp-219-symphony-build-test", "pr", "create", "--head", "codex/RDSP-219", "--title", "Create dedicated repo"]} ->
+            {"gh", ["-R", "sandbox-owner/rdsp-219-symphony-build-test", "pr", "create", "--head", "codex/RDSP-219", "--base", "main", "--title", "Create dedicated repo"]} ->
               {"created pr\n", 0}
             other -> flunk("unexpected command: #{inspect(other)}")
           end
@@ -353,6 +360,500 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "url" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test/pull/1"
              },
              "repoUrl" => "https://github.com/sandbox-owner/rdsp-219-symphony-build-test.git"
+           }
+  end
+
+  test "github_delivery exports only artifact files into dedicated repos" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_artifact_only_delivery: true,
+      github_artifact_only_strip_prefix: "elixir/"
+    )
+
+    test_pid = self()
+    workspace = Path.join(System.tmp_dir!(), "github-delivery-artifacts-#{System.unique_integer([:positive, :monotonic])}")
+    File.mkdir_p!(Path.join(workspace, "elixir/test/fixtures/jira"))
+    File.write!(Path.join(workspace, "elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json"), "{\"ok\":true}\n")
+    Process.put(:artifact_repo_pr_view_count, 0)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: export artifact repo",
+          "prTitle" => "Export artifact repo",
+          "repoOwner" => "sandbox-owner",
+          "repoName" => "rdsp-219-artifacts",
+          "repoVisibility" => "private",
+          "paths" => ["elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json"]
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["branch", "--show-current"]} ->
+              {"codex/RDSP-219\n", 0}
+
+            {"git", ["clone", "--depth", "1", "--branch", "main", "https://github.com/sandbox-owner/rdsp-219-artifacts.git", _temp_workspace]} ->
+              {"cloned\n", 0}
+
+            {"git", ["init"]} ->
+              flunk("artifact export should clone the delivery repo instead of initializing a fresh repository")
+
+            {"git", ["add", "-A"]} ->
+              exported_path = Path.join(opts[:cd], "test/fixtures/jira/rdsp_219_create_issue_payload.json")
+              nested_path = Path.join(opts[:cd], "elixir/test/fixtures/jira/rdsp_219_create_issue_payload.json")
+              send(
+                test_pid,
+                {:artifact_workspace_checked, File.exists?(exported_path), File.exists?(nested_path)}
+              )
+              {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  test/fixtures/jira/rdsp_219_create_issue_payload.json\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 aaa1111] Export artifact repo\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"aaa1111bbb2222\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/rdsp-219-artifacts", "--json", "nameWithOwner,url"]} ->
+              {"not found\n", 1}
+            {"gh", ["repo", "create", "sandbox-owner/rdsp-219-artifacts", "--private", "--confirm"]} ->
+              {"created\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/rdsp-219-artifacts", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/rdsp-219-artifacts.git"]} ->
+              {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/rdsp-219-artifacts", "pr", "view", "--json", "state,url"]} ->
+              case Process.get(:artifact_repo_pr_view_count, 0) do
+                0 ->
+                  Process.put(:artifact_repo_pr_view_count, 1)
+                  {"not found\n", 1}
+
+                _ ->
+                  {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/rdsp-219-artifacts/pull/1"}), 0}
+              end
+
+            {"gh", ["-R", "sandbox-owner/rdsp-219-artifacts", "pr", "create", "--head", "codex/RDSP-219", "--base", "main", "--title", "Export artifact repo"]} ->
+              {"created pr\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:artifact_workspace_checked, true, false}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/rdsp-219-artifacts/tree/codex/RDSP-219",
+             "commitSha" => "aaa1111bbb2222",
+             "pr" => %{
+               "action" => "created",
+               "url" => "https://github.com/sandbox-owner/rdsp-219-artifacts/pull/1"
+             },
+             "repoUrl" => "https://github.com/sandbox-owner/rdsp-219-artifacts.git"
+           }
+  end
+
+  test "github_delivery requires explicit artifact paths for dedicated repos when configured" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_artifact_only_delivery: true,
+      github_require_artifact_paths: true
+    )
+
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "github-delivery-artifact-paths-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: missing paths",
+          "prTitle" => "Missing paths",
+          "repoOwner" => "sandbox-owner",
+          "repoName" => "rdsp-219-artifacts"
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("command runner should not be called when artifact paths are required")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+                "message" =>
+                 "`github_delivery` requires explicit `paths` when artifact-only delivery is enabled for a dedicated repository."
+             }
+           }
+  end
+
+  test "github_delivery uses the configured branch repository for branch-based delivery" do
+    previous_branch_repo = System.get_env("GITHUB_BRANCH_REPO")
+
+    on_exit(fn ->
+      case previous_branch_repo do
+        nil -> System.delete_env("GITHUB_BRANCH_REPO")
+        value -> System.put_env("GITHUB_BRANCH_REPO", value)
+      end
+    end)
+
+    System.put_env("GITHUB_BRANCH_REPO", "sandbox-owner/demo-branches")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_branch_repo: "$GITHUB_BRANCH_REPO",
+      github_artifact_only_delivery: false
+    )
+
+    test_pid = self()
+
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "github-delivery-branch-repo-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(workspace)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: branch repo delivery",
+          "prTitle" => "Branch repo delivery"
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["add", "-A"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 bbb2222] Branch repo delivery\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"bbb2222ccc3333\n", 0}
+            {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "nameWithOwner,url"]} -> {"{}", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/demo-branches.git"]} -> {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "view", "--json", "state,url"]} ->
+              {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/demo-branches/pull/12"}), 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "edit", "--title", "Branch repo delivery"]} ->
+              {"updated\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:command_runner_called, "gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "nameWithOwner,url"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/demo-branches.git"], [cd: ^workspace, stderr_to_stdout: true]}
+    assert_received {:command_runner_called, "git", ["push", "-u", "delivery", "HEAD"], [cd: ^workspace, stderr_to_stdout: true]}
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/demo-branches/tree/codex/RDSP-219",
+             "commitSha" => "bbb2222ccc3333",
+             "pr" => %{
+               "action" => "updated",
+               "url" => "https://github.com/sandbox-owner/demo-branches/pull/12"
+             },
+           "repoUrl" => "https://github.com/sandbox-owner/demo-branches.git"
+           }
+  end
+
+  test "github_delivery falls back to a shared PR base when the target default branch matches the delivery branch" do
+    previous_branch_repo = System.get_env("GITHUB_BRANCH_REPO")
+
+    on_exit(fn ->
+      case previous_branch_repo do
+        nil -> System.delete_env("GITHUB_BRANCH_REPO")
+        value -> System.put_env("GITHUB_BRANCH_REPO", value)
+      end
+    end)
+
+    System.put_env("GITHUB_BRANCH_REPO", "sandbox-owner/demo-branches")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_branch_repo: "$GITHUB_BRANCH_REPO",
+      github_artifact_only_delivery: false
+    )
+
+    test_pid = self()
+
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "github-delivery-branch-repo-base-fallback-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(workspace)
+    Process.put(:branch_repo_base_fallback_pr_view_count, 0)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: branch repo base fallback",
+          "prTitle" => "Branch repo base fallback"
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["add", "-A"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 bbb2222] Branch repo base fallback\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"bbb2222ccc3333\n", 0}
+            {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "nameWithOwner,url"]} -> {"{}", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"codex/RDSP-219"}}), 0}
+            {"git", ["ls-remote", "--heads", "https://github.com/sandbox-owner/demo-branches.git", "refs/heads/main"]} ->
+              {"abc123\trefs/heads/main\n", 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/demo-branches.git"]} -> {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "view", "--json", "state,url"]} ->
+              case Process.get(:branch_repo_base_fallback_pr_view_count, 0) do
+                0 ->
+                  Process.put(:branch_repo_base_fallback_pr_view_count, 1)
+                  {"not found\n", 1}
+
+                _ ->
+                  {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/demo-branches/pull/16"}), 0}
+              end
+
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "create", "--head", "codex/RDSP-219", "--base", "main", "--title", "Branch repo base fallback"]} ->
+              {"created\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:command_runner_called, "git",
+                      ["ls-remote", "--heads", "https://github.com/sandbox-owner/demo-branches.git", "refs/heads/main"],
+                      [cd: ^workspace, stderr_to_stdout: true]}
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/demo-branches/tree/codex/RDSP-219",
+             "commitSha" => "bbb2222ccc3333",
+             "pr" => %{
+               "action" => "created",
+               "url" => "https://github.com/sandbox-owner/demo-branches/pull/16"
+             },
+           "repoUrl" => "https://github.com/sandbox-owner/demo-branches.git"
+           }
+  end
+
+  test "github_delivery treats PR creation as successful even if the follow-up PR lookup fails" do
+    previous_branch_repo = System.get_env("GITHUB_BRANCH_REPO")
+
+    on_exit(fn ->
+      case previous_branch_repo do
+        nil -> System.delete_env("GITHUB_BRANCH_REPO")
+        value -> System.put_env("GITHUB_BRANCH_REPO", value)
+      end
+    end)
+
+    System.put_env("GITHUB_BRANCH_REPO", "sandbox-owner/demo-branches")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_branch_repo: "$GITHUB_BRANCH_REPO",
+      github_artifact_only_delivery: false
+    )
+
+    test_pid = self()
+
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "github-delivery-pr-create-success-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(workspace)
+    Process.put(:branch_repo_create_only_pr_view_count, 0)
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "feat: tolerate create-only PR success",
+          "prTitle" => "Create-only PR success"
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["add", "-A"]} -> {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 bbb2222] Create-only PR success\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"bbb2222ccc3333\n", 0}
+            {"git", ["branch", "--show-current"]} -> {"codex/RDSP-219\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "nameWithOwner,url"]} -> {"{}", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/demo-branches.git"]} -> {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "view", "--json", "state,url"]} ->
+              {"not found\n", 1}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "create", "--head", "codex/RDSP-219", "--base", "main", "--title", "Create-only PR success"]} ->
+              {"https://github.com/sandbox-owner/demo-branches/pull/18\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/demo-branches/tree/codex/RDSP-219",
+             "commitSha" => "bbb2222ccc3333",
+             "pr" => %{
+               "action" => "created",
+               "url" => "https://github.com/sandbox-owner/demo-branches/pull/18"
+             },
+             "repoUrl" => "https://github.com/sandbox-owner/demo-branches.git"
+           }
+  end
+
+  test "github_delivery exports only artifact files when using the configured branch repository" do
+    previous_branch_repo = System.get_env("GITHUB_BRANCH_REPO")
+
+    on_exit(fn ->
+      case previous_branch_repo do
+        nil -> System.delete_env("GITHUB_BRANCH_REPO")
+        value -> System.put_env("GITHUB_BRANCH_REPO", value)
+      end
+    end)
+
+    System.put_env("GITHUB_BRANCH_REPO", "sandbox-owner/demo-branches")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "jira",
+      github_branch_repo: "$GITHUB_BRANCH_REPO",
+      github_artifact_only_delivery: true,
+      github_require_artifact_paths: true,
+      github_artifact_only_strip_prefix: "elixir/"
+    )
+
+    test_pid = self()
+
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "github-delivery-branch-repo-artifacts-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    File.mkdir_p!(Path.join(workspace, "elixir/docs"))
+    File.write!(Path.join(workspace, "elixir/docs/time_off_report_redesign_research.md"), "# report\n")
+
+    response =
+      DynamicTool.execute(
+        "github_delivery",
+        %{
+          "commitMessage" => "docs: export report artifact",
+          "prTitle" => "Export report artifact",
+          "paths" => ["elixir/docs/time_off_report_redesign_research.md"]
+        },
+        workspace: workspace,
+        executable_finder: fn
+          "git" -> "/usr/bin/git"
+          "gh" -> "/usr/bin/gh"
+          _ -> nil
+        end,
+        command_runner: fn command, args, opts ->
+          send(test_pid, {:command_runner_called, command, args, opts})
+
+          case {command, args} do
+            {"git", ["branch", "--show-current"]} ->
+              {"codex/RDSP-219\n", 0}
+
+            {"git", ["clone", "--depth", "1", "--branch", "main", "https://github.com/sandbox-owner/demo-branches.git", _temp_workspace]} ->
+              {"cloned\n", 0}
+
+            {"git", ["init"]} ->
+              flunk("artifact export should clone the branch repo instead of initializing a fresh repository")
+
+            {"git", ["add", "-A"]} ->
+              exported_path = Path.join(opts[:cd], "docs/time_off_report_redesign_research.md")
+              nested_path = Path.join(opts[:cd], "elixir/docs/time_off_report_redesign_research.md")
+              send(test_pid, {:artifact_workspace_checked, File.exists?(exported_path), File.exists?(nested_path)})
+              {"", 0}
+            {"git", ["status", "--porcelain"]} -> {"A  docs/time_off_report_redesign_research.md\n", 0}
+            {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 ccc3333] Export report artifact\n", 0}
+            {"git", ["rev-parse", "HEAD"]} -> {"ccc3333ddd4444\n", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "nameWithOwner,url"]} -> {"{}", 0}
+            {"gh", ["repo", "view", "sandbox-owner/demo-branches", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
+            {"git", ["remote"]} -> {"origin\n", 0}
+            {"git", ["remote", "add", "delivery", "https://github.com/sandbox-owner/demo-branches.git"]} -> {"", 0}
+            {"git", ["push", "-u", "delivery", "HEAD"]} -> {"pushed\n", 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "view", "--json", "state,url"]} ->
+              {~s({"state":"OPEN","url":"https://github.com/sandbox-owner/demo-branches/pull/15"}), 0}
+            {"gh", ["-R", "sandbox-owner/demo-branches", "pr", "edit", "--title", "Export report artifact"]} ->
+              {"updated\n", 0}
+            other -> flunk("unexpected command: #{inspect(other)}")
+          end
+        end
+      )
+
+    assert_received {:artifact_workspace_checked, true, false}
+    assert response["success"] == true
+
+    assert Jason.decode!(response["output"]) == %{
+             "branch" => "codex/RDSP-219",
+             "branchUrl" => "https://github.com/sandbox-owner/demo-branches/tree/codex/RDSP-219",
+             "commitSha" => "ccc3333ddd4444",
+             "pr" => %{
+               "action" => "updated",
+               "url" => "https://github.com/sandbox-owner/demo-branches/pull/15"
+             },
+             "repoUrl" => "https://github.com/sandbox-owner/demo-branches.git"
            }
   end
 
@@ -408,6 +909,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {"git", ["status", "--porcelain"]} -> {"A  README.md\n", 0}
             {"git", ["commit", "-F", _commit_file]} -> {"[codex/RDSP-219 abc1234] Branch test\n", 0}
             {"git", ["rev-parse", "HEAD"]} -> {"abc1234def5678\n", 0}
+            {"gh", ["repo", "view", "--json", "defaultBranchRef"]} ->
+              {~s({"defaultBranchRef":{"name":"main"}}), 0}
             {"git", ["push", "-u", "origin", "HEAD"]} -> {"remote ok\n", 0}
             {"gh", ["pr", "view", "--json", "state,url"]} -> {~s({"state":"OPEN","url":"https://github.com/Stiward3/symphony/pull/219"}), 0}
             {"gh", ["pr", "edit", "--title", "Branch test"]} -> {"updated\n", 0}
