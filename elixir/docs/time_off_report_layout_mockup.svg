@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1240" viewBox="0 0 1440 1240" role="img" aria-labelledby="title desc">
+  <title id="title">Time Off Report dashboard mockup</title>
+  <desc id="desc">A wireframe-style example layout for a redesigned time off report dashboard.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f5f7f4; }
+      .panel { fill: #ffffff; stroke: #ced6cf; stroke-width: 2; rx: 18; ry: 18; }
+      .soft { fill: #eef3ec; stroke: #ced6cf; stroke-width: 2; rx: 14; ry: 14; }
+      .title { font: 700 30px Arial, sans-serif; fill: #18352b; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #486257; }
+      .label { font: 700 18px Arial, sans-serif; fill: #18352b; }
+      .body { font: 400 16px Arial, sans-serif; fill: #486257; }
+      .small { font: 400 14px Arial, sans-serif; fill: #5e756b; }
+      .kpi { font: 700 28px Arial, sans-serif; fill: #18352b; }
+      .accent { fill: #d7e9dc; }
+      .warn { fill: #f8e7c7; }
+      .risk { fill: #f4d5d2; }
+      .line { stroke: #2d6a4f; stroke-width: 4; fill: none; }
+      .grid { stroke: #dfe6e0; stroke-width: 1; }
+      .bar1 { fill: #7fb38d; }
+      .bar2 { fill: #4f7f68; }
+      .bar3 { fill: #c8dbce; }
+      .chip { fill: #e6efe8; stroke: #c7d5cb; stroke-width: 1.5; rx: 16; ry: 16; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1440" height="1240"/>
+
+  <rect class="panel" x="48" y="36" width="1344" height="88"/>
+  <text class="title" x="76" y="76">Time Off Report</text>
+  <text class="subtitle" x="76" y="104">Department: Customer Success   •   Range: Jan-Mar 2026   •   Refreshed 08:30</text>
+  <rect class="soft" x="1182" y="58" width="180" height="44"/>
+  <text class="label" x="1236" y="86">Export</text>
+
+  <rect class="panel" x="48" y="144" width="1344" height="96"/>
+  <text class="label" x="76" y="176">Filters</text>
+  <rect class="chip" x="76" y="192" width="172" height="32"/>
+  <text class="small" x="96" y="213">Department: Support</text>
+  <rect class="chip" x="264" y="192" width="150" height="32"/>
+  <text class="small" x="284" y="213">Leave type: All</text>
+  <rect class="chip" x="430" y="192" width="182" height="32"/>
+  <text class="small" x="450" y="213">Manager: Any</text>
+  <rect class="chip" x="628" y="192" width="182" height="32"/>
+  <text class="small" x="648" y="213">Status: Active</text>
+  <rect class="chip" x="826" y="192" width="222" height="32"/>
+  <text class="small" x="846" y="213">Date range: This quarter</text>
+  <rect class="chip" x="1182" y="192" width="180" height="32"/>
+  <text class="small" x="1220" y="213">Reset filters</text>
+
+  <rect class="panel accent" x="48" y="264" width="312" height="128"/>
+  <text class="label" x="74" y="302">Employees on Leave Now</text>
+  <text class="kpi" x="74" y="350">18</text>
+  <text class="body" x="74" y="378">3 more than weekly average</text>
+
+  <rect class="panel accent" x="376" y="264" width="312" height="128"/>
+  <text class="label" x="402" y="302">Time-Off Days This Period</text>
+  <text class="kpi" x="402" y="350">264</text>
+  <text class="body" x="402" y="378">Across 67 approved requests</text>
+
+  <rect class="panel warn" x="704" y="264" width="312" height="128"/>
+  <text class="label" x="730" y="302">Upcoming Absences (30 days)</text>
+  <text class="kpi" x="730" y="350">41</text>
+  <text class="body" x="730" y="378">2 teams above coverage target</text>
+
+  <rect class="panel risk" x="1032" y="264" width="360" height="128"/>
+  <text class="label" x="1058" y="302">Exceptions Requiring Review</text>
+  <text class="kpi" x="1058" y="350">7</text>
+  <text class="body" x="1058" y="378">Overlaps, pending requests, policy outliers</text>
+
+  <rect class="panel" x="48" y="416" width="790" height="300"/>
+  <text class="label" x="76" y="450">Time Off Trend</text>
+  <text class="small" x="76" y="474">Weekly approved days</text>
+  <line class="grid" x1="90" y1="680" x2="790" y2="680"/>
+  <line class="grid" x1="90" y1="620" x2="790" y2="620"/>
+  <line class="grid" x1="90" y1="560" x2="790" y2="560"/>
+  <line class="grid" x1="90" y1="500" x2="790" y2="500"/>
+  <polyline class="line" points="96,648 182,612 268,590 354,608 440,554 526,566 612,522 698,474 784,496"/>
+  <circle cx="784" cy="496" r="6" fill="#2d6a4f"/>
+  <text class="small" x="744" y="522">Latest spike</text>
+
+  <rect class="panel" x="862" y="416" width="530" height="300"/>
+  <text class="label" x="890" y="450">Time Off By Leave Type</text>
+  <text class="small" x="890" y="474">Distribution in selected period</text>
+  <rect class="bar1" x="928" y="560" width="90" height="120"/>
+  <rect class="bar2" x="1066" y="500" width="90" height="180"/>
+  <rect class="bar3" x="1204" y="594" width="90" height="86"/>
+  <text class="small" x="922" y="704">Vacation</text>
+  <text class="small" x="1068" y="704">Sick</text>
+  <text class="small" x="1202" y="704">Other</text>
+
+  <rect class="panel" x="48" y="740" width="672" height="238"/>
+  <text class="label" x="76" y="774">Team / Manager Comparison</text>
+  <text class="small" x="76" y="798">Ranked by approved days</text>
+  <rect class="bar2" x="220" y="830" width="360" height="22"/>
+  <rect class="bar1" x="220" y="870" width="296" height="22"/>
+  <rect class="bar3" x="220" y="910" width="212" height="22"/>
+  <text class="small" x="76" y="846">Support A</text>
+  <text class="small" x="76" y="886">Support B</text>
+  <text class="small" x="76" y="926">Onboarding</text>
+
+  <rect class="panel" x="744" y="740" width="648" height="238"/>
+  <text class="label" x="772" y="774">Upcoming Coverage Risk</text>
+  <text class="small" x="772" y="798">Calendar / heatmap for overlap density</text>
+  <rect x="792" y="830" width="72" height="40" fill="#e6efe8"/>
+  <rect x="872" y="830" width="72" height="40" fill="#d7e9dc"/>
+  <rect x="952" y="830" width="72" height="40" fill="#f8e7c7"/>
+  <rect x="1032" y="830" width="72" height="40" fill="#f4d5d2"/>
+  <rect x="1112" y="830" width="72" height="40" fill="#d7e9dc"/>
+  <rect x="1192" y="830" width="72" height="40" fill="#e6efe8"/>
+  <rect x="1272" y="830" width="72" height="40" fill="#d7e9dc"/>
+  <rect x="792" y="878" width="72" height="40" fill="#d7e9dc"/>
+  <rect x="872" y="878" width="72" height="40" fill="#f8e7c7"/>
+  <rect x="952" y="878" width="72" height="40" fill="#f4d5d2"/>
+  <rect x="1032" y="878" width="72" height="40" fill="#f4d5d2"/>
+  <rect x="1112" y="878" width="72" height="40" fill="#f8e7c7"/>
+  <rect x="1192" y="878" width="72" height="40" fill="#d7e9dc"/>
+  <rect x="1272" y="878" width="72" height="40" fill="#e6efe8"/>
+
+  <rect class="panel" x="48" y="1002" width="1344" height="190"/>
+  <text class="label" x="76" y="1036">Detailed Employee Table</text>
+  <text class="small" x="76" y="1060">Sortable rows with export and drill-in drawer</text>
+  <line class="grid" x1="76" y1="1084" x2="1364" y2="1084"/>
+  <line class="grid" x1="76" y1="1124" x2="1364" y2="1124"/>
+  <line class="grid" x1="76" y1="1164" x2="1364" y2="1164"/>
+  <text class="small" x="90" y="1108">Employee</text>
+  <text class="small" x="330" y="1108">Team</text>
+  <text class="small" x="500" y="1108">Leave Type</text>
+  <text class="small" x="700" y="1108">Start</text>
+  <text class="small" x="860" y="1108">End</text>
+  <text class="small" x="1000" y="1108">Days</text>
+  <text class="small" x="1110" y="1108">Status</text>
+  <text class="small" x="1240" y="1108">Balance</text>
+  <text class="body" x="90" y="1150">A. Rivera</text>
+  <text class="body" x="330" y="1150">Support A</text>
+  <text class="body" x="500" y="1150">Vacation</text>
+  <text class="body" x="700" y="1150">Mar 18</text>
+  <text class="body" x="860" y="1150">Mar 22</text>
+  <text class="body" x="1000" y="1150">5</text>
+  <text class="body" x="1110" y="1150">Approved</text>
+  <text class="body" x="1240" y="1150">9 days</text>
+</svg>
