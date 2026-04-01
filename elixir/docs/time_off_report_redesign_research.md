@@ -295,3 +295,4 @@ This is the most credible BI-oriented update because it matches how managers sca
 
 - This research is a synthesis of general BI dashboard guidance applied to the Time Off Report use case described in Jira.
 - The ticket provided only a textual description of the current report flow, so the recommendations focus on layout, interaction model, and information hierarchy rather than pixel-level critique of the current screenshots.
+- The companion SVG is intentionally low fidelity so it can communicate layout structure without implying final visual design decisions.
